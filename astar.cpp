@@ -5,9 +5,7 @@
 #include <stdlib.h>
 #include <tuple>
 #include <vector>
-
-#include "swarm/api.h"
-#include "swarm/algorithm.h"
+#include <cassert>
 
 /* dsm: A*-search for road maps. Conventions:
  *  - Node positions are in (lat, lon) format
@@ -131,87 +129,87 @@ uint64_t dist(const Vertex* src, const Vertex* dst) {
 bool done __attribute__((aligned(128)));
 Vertex* target __attribute__((aligned(128)));
 
-#if defined ASTAR_COARSE_GRAIN  // Coarse-grain version (~800 cycles/task)
-#define PLS_SINGLE_TASKFUNC visitVertex
-#define PLS_SINGLE_TASKFUNC_ARGS uint64_t, Vertex*, Vertex*
+// #if defined ASTAR_COARSE_GRAIN  // Coarse-grain version (~800 cycles/task)
+// #define PLS_SINGLE_TASKFUNC visitVertex
+// #define PLS_SINGLE_TASKFUNC_ARGS uint64_t, Vertex*, Vertex*
 
-// fScore = actual distance from the source
-// gScore = monotonic-heuristic distance to target
-static inline void visitVertex(swarm::Timestamp gScore, uint64_t fScore,
-                               Vertex* v, Vertex* parent) {
-    if (done) return;
+// // fScore = actual distance from the source
+// // gScore = monotonic-heuristic distance to target
+// static inline void visitVertex(swarm::Timestamp gScore, uint64_t fScore,
+//                                Vertex* v, Vertex* parent) {
+//     if (done) return;
 
-    if (!v->prev) {
-        v->prev = parent;
-        if (v == target) {
-            done = true;
-        } else {
-            swarm::enqueue_all<NOHINT>(v->adj.begin(), v->adj.end(),
-                             [fScore, v] (swarm::Timestamp gScore, Adj a) {
-                // NOTE: Because heuristic is monotonic, no need to have/check closed set
-                if (!a.n->prev) {
-                    //assert(a.d_cm >= dist(v, a.n)); // OK
-                    uint64_t nFScore = fScore + a.d_cm;
-                    // Due to limited precision, there may be off-by-ones; if
-                    // so, inherit the parent's timestamp to avoid going back
-                    // in time. This is safe, it's typically a 1-cm-off calculation
-                    uint64_t nGScore = std::max(gScore, nFScore + dist(a.n, target));
-                    swarm::enqueue(visitVertex, nGScore,
-                                 swarm::Hint::cacheLine(a.n), nFScore, a.n, v);
-                }
-            }, gScore);
-        }
-    }
-}
+//     if (!v->prev) {
+//         v->prev = parent;
+//         if (v == target) {
+//             done = true;
+//         } else {
+//             swarm::enqueue_all<NOHINT>(v->adj.begin(), v->adj.end(),
+//                              [fScore, v] (swarm::Timestamp gScore, Adj a) {
+//                 // NOTE: Because heuristic is monotonic, no need to have/check closed set
+//                 if (!a.n->prev) {
+//                     //assert(a.d_cm >= dist(v, a.n)); // OK
+//                     uint64_t nFScore = fScore + a.d_cm;
+//                     // Due to limited precision, there may be off-by-ones; if
+//                     // so, inherit the parent's timestamp to avoid going back
+//                     // in time. This is safe, it's typically a 1-cm-off calculation
+//                     uint64_t nGScore = std::max(gScore, nFScore + dist(a.n, target));
+//                     swarm::enqueue(visitVertex, nGScore,
+//                                  swarm::Hint::cacheLine(a.n), nFScore, a.n, v);
+//                 }
+//             }, gScore);
+//         }
+//     }
+// }
 
-#else  // Fine-grained version, computes distances in parallel and close to the data
+// #else  // Fine-grained version, computes distances in parallel and close to the data
 
-static inline void queueVertex(swarm::Timestamp, uint64_t, Vertex*, Vertex*);
+// static inline void queueVertex(swarm::Timestamp, uint64_t, Vertex*, Vertex*);
 
-static inline void visitVertex(swarm::Timestamp gScore, uint64_t fScore,
-                               Vertex* v, Vertex* parent) {
-    if (done) return;
+// static inline void visitVertex(swarm::Timestamp gScore, uint64_t fScore,
+//                                Vertex* v, Vertex* parent) {
+//     if (done) return;
 
-    if (!v->prev) {
-        v->prev = parent;
-        if (v == target) {
-            done = true;
-        } else {
-            swarm::enqueue_all<EnqFlags(NOHINT | MAYSPEC)>(
-                             v->adj.begin(), v->adj.end(),
-                             [fScore, v] (swarm::Timestamp gScore, Adj a) {
-                uint64_t nFScore = fScore + a.d_cm;
-                swarm::enqueue(queueVertex, gScore,
-                             {swarm::Hint::cacheLine(a.n), EnqFlags::MAYSPEC},
-                             nFScore, a.n, v);
-            }, gScore);
-        }
-    }
-}
+//     if (!v->prev) {
+//         v->prev = parent;
+//         if (v == target) {
+//             done = true;
+//         } else {
+//             swarm::enqueue_all<EnqFlags(NOHINT | MAYSPEC)>(
+//                              v->adj.begin(), v->adj.end(),
+//                              [fScore, v] (swarm::Timestamp gScore, Adj a) {
+//                 uint64_t nFScore = fScore + a.d_cm;
+//                 swarm::enqueue(queueVertex, gScore,
+//                              {swarm::Hint::cacheLine(a.n), EnqFlags::MAYSPEC},
+//                              nFScore, a.n, v);
+//             }, gScore);
+//         }
+//     }
+// }
 
-static inline void queueVertex(swarm::Timestamp parentGScore, uint64_t fScore,
-                               Vertex* v, Vertex* parent) {
-    if (!v->prev) {
-        uint64_t gScore = std::max(parentGScore, fScore + dist(v, target));
-        swarm::enqueue(visitVertex, gScore,
-                     // We can non-speculatively load the "done" variable. The
-                     // concerning case is when two tasks have equal timestamp,
-                     // and one of them update "done".
-                     // 1) They are visiting the same node, in which case their
-                     // hints serialize their execution, so there aren't
-                     // concurrent accesses to "done".
-                     // 2) They are visiting different nodes, but one is about
-                     // to visit the target. It is possible that the task that
-                     // doesn't visit the target reads !done. This causes more
-                     // work than necessary, but is safe. It's equivalent to
-                     // ordering that task before the final target-reaching
-                     // task.
-                     EnqFlags(SAMEHINT | MAYSPEC),
-                     fScore, v, parent);
-    }
-}
+// static inline void queueVertex(swarm::Timestamp parentGScore, uint64_t fScore,
+//                                Vertex* v, Vertex* parent) {
+//     if (!v->prev) {
+//         uint64_t gScore = std::max(parentGScore, fScore + dist(v, target));
+//         swarm::enqueue(visitVertex, gScore,
+//                      // We can non-speculatively load the "done" variable. The
+//                      // concerning case is when two tasks have equal timestamp,
+//                      // and one of them update "done".
+//                      // 1) They are visiting the same node, in which case their
+//                      // hints serialize their execution, so there aren't
+//                      // concurrent accesses to "done".
+//                      // 2) They are visiting different nodes, but one is about
+//                      // to visit the target. It is possible that the task that
+//                      // doesn't visit the target reads !done. This causes more
+//                      // work than necessary, but is safe. It's equivalent to
+//                      // ordering that task before the final target-reaching
+//                      // task.
+//                      EnqFlags(SAMEHINT | MAYSPEC),
+//                      fScore, v, parent);
+//     }
+// }
 
-#endif
+// #endif
 
 uint64_t neighDist(Vertex* v, Vertex* w) {
     for (Adj a : v->adj) if (a.n == w) return a.d_cm;
@@ -236,10 +234,10 @@ int main(int argc, const char** argv) {
     target = &graph[targetNode];
     done = false;
 
-    swarm::enqueue(visitVertex, dist(source, target),
-            {swarm::Hint::cacheLine(source), EnqFlags::MAYSPEC}, 0ul, source,
-            (Vertex*)-1ul /*can't be null, lest we revisit the source*/);
-    swarm::run();
+    // swarm::enqueue(visitVertex, dist(source, target),
+    //         {swarm::Hint::cacheLine(source), EnqFlags::MAYSPEC}, 0ul, source,
+    //         (Vertex*)-1ul /*can't be null, lest we revisit the source*/);
+    // swarm::run();
 
     // Print the resulting path
     std::vector<Vertex*> path;
