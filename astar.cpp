@@ -38,9 +38,9 @@ struct Vertex {
     Vertex* prev; // nullptr if not visited (not in closed set)
 };
 
-using PQElement = std::tuple<uint32_t, uint32_t>;
-using MQ_Bucket = BucketMultiQueue<std::greater<uint32_t>, uint32_t, uint32_t>;
-using MQ_IO = MultiQueueIO<std::greater<PQElement>, uint32_t, uint32_t>;
+using PQElement = std::tuple<uint64_t, uint64_t>;
+using MQ_Bucket = BucketMultiQueue<std::greater<uint64_t>, uint64_t, uint64_t>;
+using MQ_IO = MultiQueueIO<std::greater<PQElement>, uint64_t, uint64_t>;
 struct stat {
   uint64_t iter = 0;
   uint64_t emptyWork = 0;
@@ -222,17 +222,19 @@ Vertex* target __attribute__((aligned(128)));
 
 // #endif
 
-void MQIOThreadTask(Graph& graph, MQ_IO &wl, stat *stats, std::atomic<uint32_t> *prios) {
+template<bool usePrefetch=true>
+void MQIOThreadTask(const Vertex* graph, MQ_IO &wl, stat *stats,
+                    std::atomic<uint64_t> *prios, 
+                    uint32_t sourceNode, uint32_t targetNode) {
     uint64_t iter = 0UL;
     uint64_t emptyWork = 0UL;
     uint64_t readCnt = 0UL;
-    uint dist;
-    GNode src;
+    uint64_t dist;
+    uint64_t src;
     PQElement* popBatch = new PQElement[batch1];
     PQElement* pushBatch = new PQElement[batch2];
 
     while (true) {
-
         uint32_t prefetchIdx;
         auto item = wl.tryPopBatch(popBatch);
         uint64_t size;
@@ -241,51 +243,55 @@ void MQIOThreadTask(Graph& graph, MQ_IO &wl, stat *stats, std::atomic<uint32_t> 
 
         if (usePrefetch) {
             for (prefetchIdx = 0; prefetchIdx < size && prefetchIdx < MAX_PREFETCH; prefetchIdx++) {
-            if (graph.getDegree(std::get<1>(popBatch[prefetchIdx])) > MAX_PREFETCH_DEG) continue;
-            __builtin_prefetch(&prios[std::get<1>(popBatch[prefetchIdx])], 0, 3);
+                uint64_t v = std::get<1>(popBatch[prefetchIdx]);
+                if (graph[v].adj.size() > MAX_PREFETCH_DEG) continue;
+                __builtin_prefetch(&prios[v], 0, 3);
             }
         }
 
+
+        uint32_t targetDist = prios[targetNode].load(std::memory_order_relaxed);
         uint64_t idx = 0;
         for (uint64_t i = 0; i < size; i++) {
             if (usePrefetch) {
-            if (i > 0 && (i % MAX_PREFETCH == 0)) {
-                uint32_t end = prefetchIdx + MAX_PREFETCH;
-                for (; prefetchIdx < size && prefetchIdx < end; prefetchIdx++) {
-                if (graph.getDegree(std::get<1>(popBatch[prefetchIdx])) > MAX_PREFETCH_DEG) continue;
-                __builtin_prefetch(&prios[std::get<1>(popBatch[prefetchIdx])], 0, 3);
+                if (i > 0 && (i % MAX_PREFETCH == 0)) {
+                    uint32_t end = prefetchIdx + MAX_PREFETCH;
+                    for (; prefetchIdx < size && prefetchIdx < end; prefetchIdx++) {
+                        uint64_t v = std::get<1>(popBatch[prefetchIdx]);
+                        if (graph[v].adj.size() > MAX_PREFETCH_DEG) continue;
+                        __builtin_prefetch(&prios[v], 0, 3);
+                    }
                 }
-            }
             }
 
             std::tie(dist, src) = popBatch[i];
-        #ifdef PERF
+#ifdef PERF
             uint32_t srcD = getPrioData(&prios[src]);
-        #else
+#else
             uint32_t srcD = prios[src].load(std::memory_order_relaxed);
-        #endif
+#endif
             ++iter;
             if (srcD < dist) {
-            emptyWork++;
-            continue;
+                emptyWork++;
+                continue;
             }
 
-            auto edgeRange = graph.edges(src, galois::MethodFlag::UNPROTECTED);
-            for (auto e : edgeRange) {
-            GNode dst   = graph.getEdgeDst(e);
-            const auto newDist = dist + graph.getEdgeData(e);        
-            pushBatch[idx] = {newDist, dst};
-            if (usePrefetch) {
-                if (graph.getDegree(dst) < MAX_PREFETCH_DEG)
-                __builtin_prefetch(&prios[dst], 0, 3);
-            }
+            for (uint32_t e = 0; e < graph[src].adj.size(); e++) {
+                auto& dst = graph[v].adj[e];
+                uint64_t newDist = dist + dist(graph[src], dst.n);
+                if (targetDist != UINT32_MAX && newDist > targetDist) continue;              
+                pushBatch[idx] = {newDist, dst};
+                if (usePrefetch) {
+                    if (graph[dst].adj.size() < MAX_PREFETCH_DEG)
+                    __builtin_prefetch(&prios[dst], 0, 3);
+                }
 
-            idx++;
-            if (idx == batch2) {
-                uint64_t k = filter(prios, pushBatch, idx);
-                if (k != 0) wl.pushBatch(k, pushBatch);
-                idx = 0;
-            }
+                idx++;
+                if (idx == batch2) {
+                    uint64_t k = filter(prios, pushBatch, idx);
+                    if (k != 0) wl.pushBatch(k, pushBatch);
+                    idx = 0;
+                }
             }
         }
 
@@ -302,13 +308,14 @@ void MQIOThreadTask(Graph& graph, MQ_IO &wl, stat *stats, std::atomic<uint32_t> 
     stats->readCnt = readCnt;
 }
 
-void astarMQIO(Vertex* graph, uint32_t sourceNode, uint32_t targetNode, 
+void astarMQIO(const Vertex* graph, uint32_t numNodes, 
+                uint32_t sourceNode, uint32_t targetNode, 
                 uint32_t threadNum, uint32_t queueNum, 
                 uint32_t batchSizePop, uint32_t batchSizePush, uint32_t opt)
 {
     MQ_IO wl(queueNum, threadNum, batchSizePop);
-    std::atomic<uint32_t> *prios = new std::atomic<uint32_t>[graph.size()];
-    for (uint i = 0; i < graph.size(); i++) {
+    std::atomic<uint64_t> *prios = new std::atomic<uint64_t>[numNodes];
+    for (uint i = 0; i < numNodes; i++) {
         prios[i].store(UINT32_MAX, std::memory_order_relaxed);
     }
     prios[sourceNode] = 0;
@@ -326,7 +333,8 @@ void astarMQIO(Vertex* graph, uint32_t sourceNode, uint32_t targetNode,
         if (opt == 0) {
             std::thread *newThread = new std::thread(
                 MQIOThreadTask<true>, std::ref(graph), 
-                std::ref(wl), &stats[i], std::ref(prios)
+                std::ref(wl), &stats[i], std::ref(prios),
+                sourceNode, targetNode
             );
             int rc = pthread_setaffinity_np(newThread->native_handle(),
                                             sizeof(cpu_set_t), &cpuset);
@@ -337,7 +345,8 @@ void astarMQIO(Vertex* graph, uint32_t sourceNode, uint32_t targetNode,
         } else {
             std::thread *newThread = new std::thread(
                 MQIOThreadTask<false>, std::ref(graph), 
-                std::ref(wl), &stats[i], std::ref(prios)
+                std::ref(wl), &stats[i], std::ref(prios),
+                sourceNode, targetNode
             );
             int rc = pthread_setaffinity_np(newThread->native_handle(),
                                             sizeof(cpu_set_t), &cpuset);
@@ -350,8 +359,10 @@ void astarMQIO(Vertex* graph, uint32_t sourceNode, uint32_t targetNode,
     CPU_ZERO(&cpuset);
     CPU_SET(0, &cpuset);
     sched_setaffinity(0, sizeof(cpuset), &cpuset);
-    if (opt == 0) MQIOThreadTask<true>(graph, wl, &stats[0], prios);
-    else MQIOThreadTask<false>(graph, wl, &stats[0], prios);
+    if (opt == 0) 
+        MQIOThreadTask<true>(graph, wl, &stats[0], prios, sourceNode, targetNode);
+    else
+        MQIOThreadTask<false>(graph, wl, &stats[0], prios, sourceNode, targetNode);
     for (std::thread*& worker : workers) {
         worker->join();
         delete worker;
@@ -407,11 +418,13 @@ int main(int argc, const char** argv) {
     done = false;
 
     if (queueType == "MQIO") {
-        astarMQIO(graph, sourceNode, targetNode, threadNum, queueNum, batchSizePop, batchSizePush, opt);
-    } else if (queueType == "MQIOPlain") {
-        astarMQIOPlain(graph, sourceNode, targetNode, threadNum, queueNum);
-    } else if (queueType == "MQBucket") {
-        astarMQBucket(graph, sourceNode, targetNode, threadNum, queueNum, bucketNum, batchSizePop, batchSizePush, opt);
+        astarMQIO(graph, numNodes, sourceNode, targetNode, threadNum, queueNum, batchSizePop, batchSizePush, opt);
+    // } else if (queueType == "MQIOPlain") {
+    //     astarMQIOPlain(graph, numNodes, sourceNode, targetNode, threadNum, queueNum);
+    // } else if (queueType == "MQBucket") {
+    //     astarMQBucket(graph, numNodes, sourceNode, targetNode, 
+    //         threadNum, queueNum, bucketNum, 
+    //         batchSizePop, batchSizePush, opt);
     } else {
         std::cerr << "Unrecognized type: " << queueType << "\n";
         return 1;
