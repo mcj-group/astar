@@ -7,6 +7,9 @@
 #include <vector>
 #include <cassert>
 
+#include "BucketQueueTryLock.h"
+#include "MultiQueueIO.h"
+
 /* dsm: A*-search for road maps. Conventions:
  *  - Node positions are in (lat, lon) format
  *  - All latitudes, longitudes, and distances are in radians unless specified
@@ -33,6 +36,14 @@ struct Vertex {
 
     // Ephemeral state (used during search)
     Vertex* prev; // nullptr if not visited (not in closed set)
+};
+
+using PQElement = std::tuple<uint32_t, uint32_t>;
+using MQ_Bucket = BucketMultiQueue<std::greater<uint32_t>, uint32_t, uint32_t>;
+using MQ_IO = MultiQueueIO<std::greater<PQElement>, uint32_t, uint32_t>;
+struct stat {
+  uint64_t iter = 0;
+  uint64_t emptyWork = 0;
 };
 
 std::tuple<Vertex*, uint32_t> LoadGraph(const char* file) {
@@ -211,14 +222,161 @@ Vertex* target __attribute__((aligned(128)));
 
 // #endif
 
+void MQIOThreadTask(Graph& graph, MQ_IO &wl, stat *stats, std::atomic<uint32_t> *prios) {
+    uint64_t iter = 0UL;
+    uint64_t emptyWork = 0UL;
+    uint64_t readCnt = 0UL;
+    uint dist;
+    GNode src;
+    PQElement* popBatch = new PQElement[batch1];
+    PQElement* pushBatch = new PQElement[batch2];
+
+    while (true) {
+
+        uint32_t prefetchIdx;
+        auto item = wl.tryPopBatch(popBatch);
+        uint64_t size;
+        if (item) size = item.get();
+        else break;
+
+        if (usePrefetch) {
+            for (prefetchIdx = 0; prefetchIdx < size && prefetchIdx < MAX_PREFETCH; prefetchIdx++) {
+            if (graph.getDegree(std::get<1>(popBatch[prefetchIdx])) > MAX_PREFETCH_DEG) continue;
+            __builtin_prefetch(&prios[std::get<1>(popBatch[prefetchIdx])], 0, 3);
+            }
+        }
+
+        uint64_t idx = 0;
+        for (uint64_t i = 0; i < size; i++) {
+            if (usePrefetch) {
+            if (i > 0 && (i % MAX_PREFETCH == 0)) {
+                uint32_t end = prefetchIdx + MAX_PREFETCH;
+                for (; prefetchIdx < size && prefetchIdx < end; prefetchIdx++) {
+                if (graph.getDegree(std::get<1>(popBatch[prefetchIdx])) > MAX_PREFETCH_DEG) continue;
+                __builtin_prefetch(&prios[std::get<1>(popBatch[prefetchIdx])], 0, 3);
+                }
+            }
+            }
+
+            std::tie(dist, src) = popBatch[i];
+        #ifdef PERF
+            uint32_t srcD = getPrioData(&prios[src]);
+        #else
+            uint32_t srcD = prios[src].load(std::memory_order_relaxed);
+        #endif
+            ++iter;
+            if (srcD < dist) {
+            emptyWork++;
+            continue;
+            }
+
+            auto edgeRange = graph.edges(src, galois::MethodFlag::UNPROTECTED);
+            for (auto e : edgeRange) {
+            GNode dst   = graph.getEdgeDst(e);
+            const auto newDist = dist + graph.getEdgeData(e);        
+            pushBatch[idx] = {newDist, dst};
+            if (usePrefetch) {
+                if (graph.getDegree(dst) < MAX_PREFETCH_DEG)
+                __builtin_prefetch(&prios[dst], 0, 3);
+            }
+
+            idx++;
+            if (idx == batch2) {
+                uint64_t k = filter(prios, pushBatch, idx);
+                if (k != 0) wl.pushBatch(k, pushBatch);
+                idx = 0;
+            }
+            }
+        }
+
+        if (idx > 0) {
+            uint64_t k = filter(prios, pushBatch, idx);
+            if (k != 0) wl.pushBatch(k, pushBatch);
+        }
+    }
+
+    delete [] pushBatch;
+    delete [] popBatch;
+    stats->iter = iter;
+    stats->emptyWork = emptyWork;
+    stats->readCnt = readCnt;
+}
+
+void astarMQIO(Vertex* graph, uint32_t sourceNode, uint32_t targetNode, 
+                uint32_t threadNum, uint32_t queueNum, 
+                uint32_t batchSizePop, uint32_t batchSizePush, uint32_t opt)
+{
+    MQ_IO wl(queueNum, threadNum, batchSizePop);
+    std::atomic<uint32_t> *prios = new std::atomic<uint32_t>[graph.size()];
+    for (uint i = 0; i < graph.size(); i++) {
+        prios[i].store(UINT32_MAX, std::memory_order_relaxed);
+    }
+    prios[sourceNode] = 0;
+    wl.push(std::make_tuple(0, sourceNode));
+
+    stat stats[threadNum];
+
+    auto begin = std::chrono::high_resolution_clock::now();
+    std::vector<std::thread*> workers;
+    cpu_set_t cpuset;
+    for (int i = 1; i < threadNum; i++) {
+        CPU_ZERO(&cpuset);
+        uint64_t coreID = i;
+        CPU_SET(coreID, &cpuset);
+        if (opt == 0) {
+            std::thread *newThread = new std::thread(
+                MQIOThreadTask<true>, std::ref(graph), 
+                std::ref(wl), &stats[i], std::ref(prios)
+            );
+            int rc = pthread_setaffinity_np(newThread->native_handle(),
+                                            sizeof(cpu_set_t), &cpuset);
+            if (rc != 0) {
+                std::cerr << "Error calling pthread_setaffinity_np: " << rc << "\n";
+            }
+            workers.push_back(newThread);
+        } else {
+            std::thread *newThread = new std::thread(
+                MQIOThreadTask<false>, std::ref(graph), 
+                std::ref(wl), &stats[i], std::ref(prios)
+            );
+            int rc = pthread_setaffinity_np(newThread->native_handle(),
+                                            sizeof(cpu_set_t), &cpuset);
+            if (rc != 0) {
+                std::cerr << "Error calling pthread_setaffinity_np: " << rc << "\n";
+            }
+            workers.push_back(newThread);
+        }
+    }
+    CPU_ZERO(&cpuset);
+    CPU_SET(0, &cpuset);
+    sched_setaffinity(0, sizeof(cpuset), &cpuset);
+    if (opt == 0) MQIOThreadTask<true>(graph, wl, &stats[0], prios);
+    else MQIOThreadTask<false>(graph, wl, &stats[0], prios);
+    for (std::thread*& worker : workers) {
+        worker->join();
+        delete worker;
+    }
+
+    auto end = std::chrono::high_resolution_clock::now();
+    auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(end-begin).count();
+    if (!wl.empty()) {
+        std::cout << "not empty\n";
+    }
+
+    wl.stat();
+    std::cout << "runtime_ms " << ms << "\n";
+}
+
+
 uint64_t neighDist(Vertex* v, Vertex* w) {
     for (Adj a : v->adj) if (a.n == w) return a.d_cm;
     assert(false);  // w should be in v's adjacency list
 }
 
 int main(int argc, const char** argv) {
-    if (argc < 2 || argc > 4) {
-        printf("Usage: %s <inFile> [startNode endNode]\n", argv[0]);
+    if (argc < 2) {
+        printf("Usage: %s <inFile> [startNode endNode] [qType] [thread queue bucketNum batchPop batchPush opt]\n", argv[0]);
+        printf("Types: MQIO / MQIOPlain / MQBucket\n");
         return -1;
     }
 
@@ -228,16 +386,36 @@ int main(int argc, const char** argv) {
 
     uint32_t sourceNode = (argc > 2)? std::min((uint32_t)atoi(argv[2]), numNodes-1) : 1*numNodes/10;
     uint32_t targetNode = (argc > 3)? std::min((uint32_t)atoi(argv[3]), numNodes-1) : 9*numNodes/10;
+    std::string queueType(argv[4]);
+    uint32_t threadNum = atol(argv[5]);
+    uint32_t queueNum = atol(argv[6]);
+    uint32_t bucketNum = atol(argv[7]);
+    uint32_t batchSizePop = atol(argv[8]);
+    uint32_t batchSizePush = atol(argv[9]);
+    uint32_t opt = atol(argv[10]);
     printf("Finding shortest path between nodes %d and %d\n", sourceNode, targetNode);
+    printf("Type: %d\n", queueType);
+    printf("Threads: %d\n", queueNum);
+    printf("Queues: %d\n", queueNum);
+    printf("Buckets: %d\n", bucketNum);
+    printf("batchSizePop: %d\n", batchSizePop);
+    printf("batchSizePush: %d\n", batchSizePush);
+    printf("opt: %d\n", opt);
 
     Vertex* source = &graph[sourceNode];
     target = &graph[targetNode];
     done = false;
 
-    // swarm::enqueue(visitVertex, dist(source, target),
-    //         {swarm::Hint::cacheLine(source), EnqFlags::MAYSPEC}, 0ul, source,
-    //         (Vertex*)-1ul /*can't be null, lest we revisit the source*/);
-    // swarm::run();
+    if (queueType == "MQIO") {
+        astarMQIO(graph, sourceNode, targetNode, threadNum, queueNum, batchSizePop, batchSizePush, opt);
+    } else if (queueType == "MQIOPlain") {
+        astarMQIOPlain(graph, sourceNode, targetNode, threadNum, queueNum);
+    } else if (queueType == "MQBucket") {
+        astarMQBucket(graph, sourceNode, targetNode, threadNum, queueNum, bucketNum, batchSizePop, batchSizePush, opt);
+    } else {
+        std::cerr << "Unrecognized type: " << queueType << "\n";
+        return 1;
+    }
 
     // Print the resulting path
     std::vector<Vertex*> path;
