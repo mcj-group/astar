@@ -6,6 +6,7 @@
 #include <tuple>
 #include <vector>
 #include <cassert>
+#include <thread>
 
 #include "BucketQueueTryLock.h"
 #include "MultiQueueIO.h"
@@ -22,11 +23,13 @@
  */
 
 const double EarthRadius_cm = 637100000.0;
+constexpr static const unsigned MAX_PREFETCH = 64;
+constexpr static const unsigned MAX_PREFETCH_DEG = 1024;
 
 struct Vertex;
 
 struct Adj {
-    Vertex* n;
+    uint64_t n;
     uint64_t d_cm;
 };
 
@@ -35,7 +38,7 @@ struct Vertex {
     std::vector<Adj> adj;
 
     // Ephemeral state (used during search)
-    Vertex* prev; // nullptr if not visited (not in closed set)
+    uint64_t prev; // UINT64_MAX if not visited (not in closed set)
 };
 
 using PQElement = std::tuple<uint64_t, uint64_t>;
@@ -45,6 +48,7 @@ struct stat {
   uint64_t iter = 0;
   uint64_t emptyWork = 0;
 };
+
 
 std::tuple<Vertex*, uint32_t> LoadGraph(const char* file) {
     const uint32_t MAGIC_NUMBER = 0x150842A7 + 0;  // increment every time you change the file format
@@ -94,9 +98,9 @@ std::tuple<Vertex*, uint32_t> LoadGraph(const char* file) {
         graph[i].lon = readD();
         uint32_t n = readU();
         graph[i].adj.resize(n);
-        for (uint32_t j = 0; j < n; j++) graph[i].adj[j].n = &graph[readU()];
+        for (uint32_t j = 0; j < n; j++) graph[i].adj[j].n = readU();
         for (uint32_t j = 0; j < n; j++) graph[i].adj[j].d_cm = readD()*EarthRadius_cm;
-        graph[i].prev = nullptr;
+        graph[i].prev = UINT64_MAX;
         i++;
     }
 
@@ -137,8 +141,8 @@ uint64_t dist(const Vertex* src, const Vertex* dst) {
 }
 
 
-bool done __attribute__((aligned(128)));
-Vertex* target __attribute__((aligned(128)));
+// bool done __attribute__((aligned(128)));
+// Vertex* target __attribute__((aligned(128)));
 
 // #if defined ASTAR_COARSE_GRAIN  // Coarse-grain version (~800 cycles/task)
 // #define PLS_SINGLE_TASKFUNC visitVertex
@@ -379,8 +383,9 @@ void astarMQIO(const Vertex* graph, uint32_t numNodes,
 }
 
 
-uint64_t neighDist(Vertex* v, Vertex* w) {
-    for (Adj a : v->adj) if (a.n == w) return a.d_cm;
+uint64_t neighDist(Vertex* graph, uint64_t v, uint64_t w) {
+    auto& vnode = graph[v];
+    for (Adj a : vnode.adj) if (a.n == w) return a.d_cm;
     assert(false);  // w should be in v's adjacency list
 }
 
@@ -405,17 +410,13 @@ int main(int argc, const char** argv) {
     uint32_t batchSizePush = atol(argv[9]);
     uint32_t opt = atol(argv[10]);
     printf("Finding shortest path between nodes %d and %d\n", sourceNode, targetNode);
-    printf("Type: %d\n", queueType);
+    printf("Type: %s\n", queueType.c_str());
     printf("Threads: %d\n", queueNum);
     printf("Queues: %d\n", queueNum);
     printf("Buckets: %d\n", bucketNum);
     printf("batchSizePop: %d\n", batchSizePop);
     printf("batchSizePush: %d\n", batchSizePush);
     printf("opt: %d\n", opt);
-
-    Vertex* source = &graph[sourceNode];
-    target = &graph[targetNode];
-    done = false;
 
     if (queueType == "MQIO") {
         astarMQIO(graph, numNodes, sourceNode, targetNode, threadNum, queueNum, batchSizePop, batchSizePush, opt);
@@ -431,30 +432,31 @@ int main(int argc, const char** argv) {
     }
 
     // Print the resulting path
-    std::vector<Vertex*> path;
-    Vertex* cur = target;
+    std::vector<uint64_t> path;
+    uint64_t cur = targetNode;
     while (true) {
         path.push_back(cur);
-        if (cur == source) break;
-        cur = cur->prev;
-        assert(cur);
+        if (cur == sourceNode) break;
+        cur = graph[cur].prev;
+        // assert(cur);
     }
     std::reverse(path.begin(), path.end());
 
     uint64_t totalDist_cm = 0;
     for (uint32_t i = 0; i < path.size()-1; i++) {
-        uint64_t curDist_cm = neighDist(path[i], path[i+1]);
+        uint64_t curDist_cm = neighDist(graph, path[i], path[i+1]);
         totalDist_cm += curDist_cm;
-        printf("%4d: %9ld -> %9ld | %8ld.%02ld m | %8ld.%02ld m\n", i, path[i] - graph, path[i+1] - graph,
+        printf("%4d: %9ld -> %9ld | %8ld.%02ld m | %8ld.%02ld m\n", i, path[i], path[i+1],
                 curDist_cm / 100, curDist_cm % 100, totalDist_cm / 100, totalDist_cm % 100);
     }
 
-    uint64_t directDist_cm = dist(source, target);
+    uint64_t directDist_cm = dist(&graph[sourceNode], &graph[targetNode]);
     printf("As-the-crow-flies distance:                    %8ld.%02ld m\n", directDist_cm / 100, directDist_cm % 100);
 
     // Save the path coordinates in binary
     FILE* outFile = fopen("path.bin", "wb");
-    for (Vertex* v : path) {
+    for (uint64_t vID : path) {
+        Vertex* v = &graph[vID];
         fwrite(&v->lat, sizeof(double), 1, outFile);
         fwrite(&v->lon, sizeof(double), 1, outFile);
     }
