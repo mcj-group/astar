@@ -148,34 +148,34 @@ uint64_t dist(const Vertex* src, const Vertex* dst) {
 // #define PLS_SINGLE_TASKFUNC visitVertex
 // #define PLS_SINGLE_TASKFUNC_ARGS uint64_t, Vertex*, Vertex*
 
-// // fScore = actual distance from the source
-// // gScore = monotonic-heuristic distance to target
-// static inline void visitVertex(swarm::Timestamp gScore, uint64_t fScore,
-//                                Vertex* v, Vertex* parent) {
-//     if (done) return;
+// fScore = actual distance from the source
+// gScore = monotonic-heuristic distance to target
+static inline void visitVertex(swarm::Timestamp gScore, uint64_t fScore,
+                               Vertex* v, Vertex* parent) {
+    if (done) return;
 
-//     if (!v->prev) {
-//         v->prev = parent;
-//         if (v == target) {
-//             done = true;
-//         } else {
-//             swarm::enqueue_all<NOHINT>(v->adj.begin(), v->adj.end(),
-//                              [fScore, v] (swarm::Timestamp gScore, Adj a) {
-//                 // NOTE: Because heuristic is monotonic, no need to have/check closed set
-//                 if (!a.n->prev) {
-//                     //assert(a.d_cm >= dist(v, a.n)); // OK
-//                     uint64_t nFScore = fScore + a.d_cm;
-//                     // Due to limited precision, there may be off-by-ones; if
-//                     // so, inherit the parent's timestamp to avoid going back
-//                     // in time. This is safe, it's typically a 1-cm-off calculation
-//                     uint64_t nGScore = std::max(gScore, nFScore + dist(a.n, target));
-//                     swarm::enqueue(visitVertex, nGScore,
-//                                  swarm::Hint::cacheLine(a.n), nFScore, a.n, v);
-//                 }
-//             }, gScore);
-//         }
-//     }
-// }
+    if (!v->prev) {
+        v->prev = parent;
+        if (v == target) {
+            done = true;
+        } else {
+            swarm::enqueue_all<NOHINT>(v->adj.begin(), v->adj.end(),
+                             [fScore, v] (swarm::Timestamp gScore, Adj a) {
+                // NOTE: Because heuristic is monotonic, no need to have/check closed set
+                if (!a.n->prev) {
+                    //assert(a.d_cm >= dist(v, a.n)); // OK
+                    uint64_t nFScore = fScore + a.d_cm;
+                    // Due to limited precision, there may be off-by-ones; if
+                    // so, inherit the parent's timestamp to avoid going back
+                    // in time. This is safe, it's typically a 1-cm-off calculation
+                    uint64_t nGScore = std::max(gScore, nFScore + dist(a.n, target));
+                    swarm::enqueue(visitVertex, nGScore,
+                                 swarm::Hint::cacheLine(a.n), nFScore, a.n, v);
+                }
+            }, gScore);
+        }
+    }
+}
 
 // #else  // Fine-grained version, computes distances in parallel and close to the data
 
@@ -226,17 +226,50 @@ uint64_t dist(const Vertex* src, const Vertex* dst) {
 
 // #endif
 
+
+#ifdef PERF
+uint32_t __attribute__ ((noinline)) filter(std::atomic<uint64_t> *prios, PQElement* pushBatch, uint64_t pushSize) {
+#else
+inline uint32_t filter(std::atomic<uint64_t> *prios, PQElement* pushBatch, uint64_t pushSize) {
+#endif
+  uint64_t k = 0;
+  for (uint64_t i = 0; i < pushSize; i++) {
+    uint32_t nd = std::get<0>(pushBatch[i]);
+    uint64_t v = std::get<1>(pushBatch[i]);
+#ifdef PERF
+    uint64_t d = getPrioData(&prios[v]);
+#else
+    uint64_t d = prios[v].load(std::memory_order_relaxed);
+#endif
+    bool swapped = false;
+    do {
+      if (d <= nd) break;
+      swapped = prios[v].compare_exchange_weak(
+          d, nd,
+          std::memory_order_release,
+          std::memory_order_relaxed);
+    } while(!swapped);
+    if (!swapped) continue;
+
+    std::get<0>(pushBatch[k]) = nd;
+    std::get<1>(pushBatch[k]) = v;
+    k++;
+  }
+  return k;
+}
+
 template<bool usePrefetch=true>
 void MQIOThreadTask(const Vertex* graph, MQ_IO &wl, stat *stats,
                     std::atomic<uint64_t> *prios, 
-                    uint32_t sourceNode, uint32_t targetNode) {
+                    uint32_t sourceNode, uint32_t targetNode,
+                    uint32_t batchSizePop, uint32_t batchSizePush) {
     uint64_t iter = 0UL;
     uint64_t emptyWork = 0UL;
     uint64_t readCnt = 0UL;
-    uint64_t dist;
+    uint64_t srcDist;
     uint64_t src;
-    PQElement* popBatch = new PQElement[batch1];
-    PQElement* pushBatch = new PQElement[batch2];
+    PQElement* popBatch = new PQElement[batchSizePop];
+    PQElement* pushBatch = new PQElement[batchSizePush];
 
     while (true) {
         uint32_t prefetchIdx;
@@ -268,22 +301,22 @@ void MQIOThreadTask(const Vertex* graph, MQ_IO &wl, stat *stats,
                 }
             }
 
-            std::tie(dist, src) = popBatch[i];
+            std::tie(srcDist, src) = popBatch[i];
 #ifdef PERF
-            uint32_t srcD = getPrioData(&prios[src]);
+            uint64_t srcD = getPrioData(&prios[src]);
 #else
-            uint32_t srcD = prios[src].load(std::memory_order_relaxed);
+            uint64_t srcD = prios[src].load(std::memory_order_relaxed);
 #endif
             ++iter;
-            if (srcD < dist) {
+            if (srcD < srcDist) {
                 emptyWork++;
                 continue;
             }
 
             for (uint32_t e = 0; e < graph[src].adj.size(); e++) {
-                auto& dst = graph[v].adj[e];
-                uint64_t newDist = dist + dist(graph[src], dst.n);
-                if (targetDist != UINT32_MAX && newDist > targetDist) continue;              
+                uint64_t dst = graph[src].adj[e].n;
+                uint64_t newDist = srcDist + dist(&graph[src], &graph[dst]);
+                if (targetDist != UINT64_MAX && newDist > targetDist) continue;              
                 pushBatch[idx] = {newDist, dst};
                 if (usePrefetch) {
                     if (graph[dst].adj.size() < MAX_PREFETCH_DEG)
@@ -291,7 +324,7 @@ void MQIOThreadTask(const Vertex* graph, MQ_IO &wl, stat *stats,
                 }
 
                 idx++;
-                if (idx == batch2) {
+                if (idx == batchSizePush) {
                     uint64_t k = filter(prios, pushBatch, idx);
                     if (k != 0) wl.pushBatch(k, pushBatch);
                     idx = 0;
@@ -309,7 +342,6 @@ void MQIOThreadTask(const Vertex* graph, MQ_IO &wl, stat *stats,
     delete [] popBatch;
     stats->iter = iter;
     stats->emptyWork = emptyWork;
-    stats->readCnt = readCnt;
 }
 
 void astarMQIO(const Vertex* graph, uint32_t numNodes, 
@@ -320,7 +352,7 @@ void astarMQIO(const Vertex* graph, uint32_t numNodes,
     MQ_IO wl(queueNum, threadNum, batchSizePop);
     std::atomic<uint64_t> *prios = new std::atomic<uint64_t>[numNodes];
     for (uint i = 0; i < numNodes; i++) {
-        prios[i].store(UINT32_MAX, std::memory_order_relaxed);
+        prios[i].store(UINT64_MAX, std::memory_order_relaxed);
     }
     prios[sourceNode] = 0;
     wl.push(std::make_tuple(0, sourceNode));
@@ -338,7 +370,8 @@ void astarMQIO(const Vertex* graph, uint32_t numNodes,
             std::thread *newThread = new std::thread(
                 MQIOThreadTask<true>, std::ref(graph), 
                 std::ref(wl), &stats[i], std::ref(prios),
-                sourceNode, targetNode
+                sourceNode, targetNode,
+                batchSizePop, batchSizePush
             );
             int rc = pthread_setaffinity_np(newThread->native_handle(),
                                             sizeof(cpu_set_t), &cpuset);
@@ -350,7 +383,8 @@ void astarMQIO(const Vertex* graph, uint32_t numNodes,
             std::thread *newThread = new std::thread(
                 MQIOThreadTask<false>, std::ref(graph), 
                 std::ref(wl), &stats[i], std::ref(prios),
-                sourceNode, targetNode
+                sourceNode, targetNode,
+                batchSizePop, batchSizePush
             );
             int rc = pthread_setaffinity_np(newThread->native_handle(),
                                             sizeof(cpu_set_t), &cpuset);
@@ -364,9 +398,11 @@ void astarMQIO(const Vertex* graph, uint32_t numNodes,
     CPU_SET(0, &cpuset);
     sched_setaffinity(0, sizeof(cpuset), &cpuset);
     if (opt == 0) 
-        MQIOThreadTask<true>(graph, wl, &stats[0], prios, sourceNode, targetNode);
+        MQIOThreadTask<true>(graph, wl, &stats[0], prios, sourceNode, targetNode, 
+                                batchSizePop, batchSizePush);
     else
-        MQIOThreadTask<false>(graph, wl, &stats[0], prios, sourceNode, targetNode);
+        MQIOThreadTask<false>(graph, wl, &stats[0], prios, sourceNode, targetNode, 
+                                batchSizePop, batchSizePush);
     for (std::thread*& worker : workers) {
         worker->join();
         delete worker;
@@ -382,6 +418,109 @@ void astarMQIO(const Vertex* graph, uint32_t numNodes,
     std::cout << "runtime_ms " << ms << "\n";
 }
 
+void MQIOPlainThreadTask(const Vertex* graph, MQ_IO &wl, stat *stats,
+                    std::atomic<uint64_t> *prios, 
+                    uint32_t sourceNode, uint32_t targetNode)
+{
+    uint64_t iter = 0UL;
+    uint64_t emptyWork = 0UL;
+    uint64_t readCnt = 0UL;
+    uint64_t fScore;
+    uint64_t src;
+
+    while (true) {
+        auto item = wl.tryPop();
+        if (item) std::tie(srcDist, src) = item.get();
+        else break;
+
+        uint64_t targetDist = prios[targetNode].load(std::memory_order_relaxed);
+#ifdef PERF
+        uint64_t srcF = getPrioData(&prios[src]);
+#else
+        uint64_t srcF = prios[src].load(std::memory_order_relaxed);
+#endif
+        ++iter;
+        // if (srcF < fScore) {
+        //     emptyWork++;
+        //     continue;
+        // }
+
+        for (uint32_t e = 0; e < graph[src].adj.size(); e++) {
+            auto& adjNode = graph[src].adj[e];
+            uint64_t dst = adjNode.n;
+            uint64_t nFScore = fScore + adjNode.d_cm;
+            uint64_t nGScore = std::max(gScore, nFScore + dist(&graph[dst], &graph[target]));
+            if (targetDist != UINT64_MAX && nGScore > targetDist) continue;              
+            uint64_t d = prios[dst].load(std::memory_order_relaxed);
+            bool swapped = false;
+            do {
+                if (d <= nGScore) break;
+                swapped = prios[dst].compare_exchange_weak(
+                    d, nGScore,
+                    std::memory_order_release,
+                    std::memory_order_relaxed);
+            } while(!swapped);
+            if (!swapped) continue;
+            graph[dst].prev = src;
+            wl.push({nGScore, dst});
+        }
+    }
+
+    stats->iter = iter;
+    stats->emptyWork = emptyWork;
+}
+
+void astarMQIOPlain(const Vertex* graph, uint32_t numNodes, 
+                uint32_t sourceNode, uint32_t targetNode, 
+                uint32_t threadNum, uint32_t queueNum)
+{
+    MQ_IO wl(queueNum, threadNum, 1);
+    std::atomic<uint64_t> *prios = new std::atomic<uint64_t>[numNodes];
+    for (uint i = 0; i < numNodes; i++) {
+        prios[i].store(UINT64_MAX, std::memory_order_relaxed);
+    }
+    prios[sourceNode] = 0;
+    wl.push(std::make_tuple(0, sourceNode));
+
+    stat stats[threadNum];
+
+    auto begin = std::chrono::high_resolution_clock::now();
+    std::vector<std::thread*> workers;
+    cpu_set_t cpuset;
+    for (int i = 1; i < threadNum; i++) {
+        CPU_ZERO(&cpuset);
+        uint64_t coreID = i;
+        CPU_SET(coreID, &cpuset);
+        std::thread *newThread = new std::thread(
+            MQIOPlainThreadTask, std::ref(graph), 
+            std::ref(wl), &stats[i], std::ref(prios),
+            sourceNode, targetNode
+        );
+        int rc = pthread_setaffinity_np(newThread->native_handle(),
+                                        sizeof(cpu_set_t), &cpuset);
+        if (rc != 0) {
+            std::cerr << "Error calling pthread_setaffinity_np: " << rc << "\n";
+        }
+        workers.push_back(newThread);
+    }
+    CPU_ZERO(&cpuset);
+    CPU_SET(0, &cpuset);
+    sched_setaffinity(0, sizeof(cpuset), &cpuset);
+    MQIOPlainThreadTask(graph, wl, &stats[0], prios, sourceNode, targetNode);
+    for (std::thread*& worker : workers) {
+        worker->join();
+        delete worker;
+    }
+
+    auto end = std::chrono::high_resolution_clock::now();
+    auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(end-begin).count();
+    if (!wl.empty()) {
+        std::cout << "not empty\n";
+    }
+
+    wl.stat();
+    std::cout << "runtime_ms " << ms << "\n";
+}
 
 uint64_t neighDist(Vertex* graph, uint64_t v, uint64_t w) {
     auto& vnode = graph[v];
@@ -420,8 +559,8 @@ int main(int argc, const char** argv) {
 
     if (queueType == "MQIO") {
         astarMQIO(graph, numNodes, sourceNode, targetNode, threadNum, queueNum, batchSizePop, batchSizePush, opt);
-    // } else if (queueType == "MQIOPlain") {
-    //     astarMQIOPlain(graph, numNodes, sourceNode, targetNode, threadNum, queueNum);
+    } else if (queueType == "MQIOPlain") {
+        astarMQIOPlain(graph, numNodes, sourceNode, targetNode, threadNum, queueNum);
     // } else if (queueType == "MQBucket") {
     //     astarMQBucket(graph, numNodes, sourceNode, targetNode, 
     //         threadNum, queueNum, bucketNum, 
