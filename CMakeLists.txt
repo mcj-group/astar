@@ -13,4 +13,4 @@ file(GLOB SOURCES
 )
 
 add_executable(astar ${SOURCES})
-target_link_libraries(astar ${Boost_LIBRARIES})
+target_link_libraries(astar pthread ${Boost_LIBRARIES})
