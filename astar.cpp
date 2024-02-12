@@ -2,6 +2,7 @@
 #include <cmath>
 #include <fstream>
 #include <iostream>
+#include <fstream>
 #include <stdlib.h>
 #include <tuple>
 #include <vector>
@@ -150,32 +151,32 @@ uint64_t dist(const Vertex* src, const Vertex* dst) {
 
 // fScore = actual distance from the source
 // gScore = monotonic-heuristic distance to target
-static inline void visitVertex(swarm::Timestamp gScore, uint64_t fScore,
-                               Vertex* v, Vertex* parent) {
-    if (done) return;
+// static inline void visitVertex(swarm::Timestamp gScore, uint64_t fScore,
+//                                Vertex* v, Vertex* parent) {
+//     if (done) return;
 
-    if (!v->prev) {
-        v->prev = parent;
-        if (v == target) {
-            done = true;
-        } else {
-            swarm::enqueue_all<NOHINT>(v->adj.begin(), v->adj.end(),
-                             [fScore, v] (swarm::Timestamp gScore, Adj a) {
-                // NOTE: Because heuristic is monotonic, no need to have/check closed set
-                if (!a.n->prev) {
-                    //assert(a.d_cm >= dist(v, a.n)); // OK
-                    uint64_t nFScore = fScore + a.d_cm;
-                    // Due to limited precision, there may be off-by-ones; if
-                    // so, inherit the parent's timestamp to avoid going back
-                    // in time. This is safe, it's typically a 1-cm-off calculation
-                    uint64_t nGScore = std::max(gScore, nFScore + dist(a.n, target));
-                    swarm::enqueue(visitVertex, nGScore,
-                                 swarm::Hint::cacheLine(a.n), nFScore, a.n, v);
-                }
-            }, gScore);
-        }
-    }
-}
+//     if (!v->prev) {
+//         v->prev = parent;
+//         if (v == target) {
+//             done = true;
+//         } else {
+//             swarm::enqueue_all<NOHINT>(v->adj.begin(), v->adj.end(),
+//                              [fScore, v] (swarm::Timestamp gScore, Adj a) {
+//                 // NOTE: Because heuristic is monotonic, no need to have/check closed set
+//                 if (!a.n->prev) {
+//                     //assert(a.d_cm >= dist(v, a.n)); // OK
+//                     uint64_t nFScore = fScore + a.d_cm;
+//                     // Due to limited precision, there may be off-by-ones; if
+//                     // so, inherit the parent's timestamp to avoid going back
+//                     // in time. This is safe, it's typically a 1-cm-off calculation
+//                     uint64_t nGScore = std::max(gScore, nFScore + dist(a.n, target));
+//                     swarm::enqueue(visitVertex, nGScore,
+//                                  swarm::Hint::cacheLine(a.n), nFScore, a.n, v);
+//                 }
+//             }, gScore);
+//         }
+//     }
+// }
 
 // #else  // Fine-grained version, computes distances in parallel and close to the data
 
@@ -418,26 +419,26 @@ void astarMQIO(const Vertex* graph, uint32_t numNodes,
     std::cout << "runtime_ms " << ms << "\n";
 }
 
-void MQIOPlainThreadTask(const Vertex* graph, MQ_IO &wl, stat *stats,
+void MQIOPlainThreadTask(Vertex* graph, MQ_IO &wl, stat *stats,
                     std::atomic<uint64_t> *prios, 
                     uint32_t sourceNode, uint32_t targetNode)
 {
     uint64_t iter = 0UL;
     uint64_t emptyWork = 0UL;
     uint64_t readCnt = 0UL;
-    uint64_t fScore;
+    uint64_t gScore;
     uint64_t src;
 
     while (true) {
         auto item = wl.tryPop();
-        if (item) std::tie(srcDist, src) = item.get();
+        if (item) std::tie(gScore, src) = item.get();
         else break;
 
         uint64_t targetDist = prios[targetNode].load(std::memory_order_relaxed);
 #ifdef PERF
-        uint64_t srcF = getPrioData(&prios[src]);
+        uint64_t fScore = getPrioData(&prios[src]);
 #else
-        uint64_t srcF = prios[src].load(std::memory_order_relaxed);
+        uint64_t fScore = prios[src].load(std::memory_order_relaxed);
 #endif
         ++iter;
         // if (srcF < fScore) {
@@ -449,14 +450,14 @@ void MQIOPlainThreadTask(const Vertex* graph, MQ_IO &wl, stat *stats,
             auto& adjNode = graph[src].adj[e];
             uint64_t dst = adjNode.n;
             uint64_t nFScore = fScore + adjNode.d_cm;
-            uint64_t nGScore = std::max(gScore, nFScore + dist(&graph[dst], &graph[target]));
-            if (targetDist != UINT64_MAX && nGScore > targetDist) continue;              
+            uint64_t nGScore = std::max(gScore, nFScore + dist(&graph[dst], &graph[targetNode]));
+            if (targetDist != UINT64_MAX && nFScore > targetDist) continue;              
             uint64_t d = prios[dst].load(std::memory_order_relaxed);
             bool swapped = false;
             do {
-                if (d <= nGScore) break;
+                if (d <= nFScore) break;
                 swapped = prios[dst].compare_exchange_weak(
-                    d, nGScore,
+                    d, nFScore,
                     std::memory_order_release,
                     std::memory_order_relaxed);
             } while(!swapped);
@@ -470,7 +471,7 @@ void MQIOPlainThreadTask(const Vertex* graph, MQ_IO &wl, stat *stats,
     stats->emptyWork = emptyWork;
 }
 
-void astarMQIOPlain(const Vertex* graph, uint32_t numNodes, 
+void astarMQIOPlain(Vertex* graph, uint32_t numNodes, 
                 uint32_t sourceNode, uint32_t targetNode, 
                 uint32_t threadNum, uint32_t queueNum)
 {
@@ -522,6 +523,54 @@ void astarMQIOPlain(const Vertex* graph, uint32_t numNodes,
     std::cout << "runtime_ms " << ms << "\n";
 }
 
+void astarSerial(Vertex* graph, uint32_t numNodes, 
+                uint32_t sourceNode, uint32_t targetNode)
+{
+    using PQ = std::priority_queue<
+        PQElement, 
+        std::vector<PQElement>,
+        std::greater<PQElement>
+    >;
+    PQ wl;
+
+    std::vector<uint64_t> prios(numNodes, UINT64_MAX);
+    prios[sourceNode] = 0;
+    wl.push(std::make_tuple(0, sourceNode));
+
+    auto begin = std::chrono::high_resolution_clock::now();
+
+    uint64_t gScore;
+    uint64_t src;
+    uint64_t iter = 0;
+    while (!wl.empty()) {
+        std::tie(gScore, src) = wl.top();
+        wl.pop();
+
+        uint64_t targetDist = prios[targetNode];
+        uint64_t fScore = prios[src];
+        ++iter;
+
+        for (uint32_t e = 0; e < graph[src].adj.size(); e++) {
+            auto& adjNode = graph[src].adj[e];
+            uint64_t dst = adjNode.n;
+            uint64_t nFScore = fScore + adjNode.d_cm;
+            uint64_t nGScore = std::max(gScore, nFScore + dist(&graph[dst], &graph[targetNode]));
+            if (targetDist != UINT64_MAX && nFScore > targetDist) continue;              
+            uint64_t d = prios[dst];
+            if (d <= nFScore) continue;
+            prios[dst] = nFScore;
+            graph[dst].prev = src;
+            wl.push({nGScore, dst});
+        }
+    }
+
+
+    auto end = std::chrono::high_resolution_clock::now();
+    auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(end-begin).count();
+    std::cout << "runtime_ms " << ms << "\n";
+    std::cout << "iter " << iter << "\n";
+}
+
 uint64_t neighDist(Vertex* graph, uint64_t v, uint64_t w) {
     auto& vnode = graph[v];
     for (Adj a : vnode.adj) if (a.n == w) return a.d_cm;
@@ -541,32 +590,35 @@ int main(int argc, const char** argv) {
 
     uint32_t sourceNode = (argc > 2)? std::min((uint32_t)atoi(argv[2]), numNodes-1) : 1*numNodes/10;
     uint32_t targetNode = (argc > 3)? std::min((uint32_t)atoi(argv[3]), numNodes-1) : 9*numNodes/10;
-    std::string queueType(argv[4]);
+    std::string algoType(argv[4]);
     uint32_t threadNum = atol(argv[5]);
     uint32_t queueNum = atol(argv[6]);
     uint32_t bucketNum = atol(argv[7]);
     uint32_t batchSizePop = atol(argv[8]);
     uint32_t batchSizePush = atol(argv[9]);
     uint32_t opt = atol(argv[10]);
+    uint32_t printFull = atol(argv[10]);
     printf("Finding shortest path between nodes %d and %d\n", sourceNode, targetNode);
-    printf("Type: %s\n", queueType.c_str());
-    printf("Threads: %d\n", queueNum);
+    printf("Type: %s\n", algoType.c_str());
+    printf("Threads: %d\n", threadNum);
     printf("Queues: %d\n", queueNum);
     printf("Buckets: %d\n", bucketNum);
     printf("batchSizePop: %d\n", batchSizePop);
     printf("batchSizePush: %d\n", batchSizePush);
     printf("opt: %d\n", opt);
 
-    if (queueType == "MQIO") {
+    if (algoType == "MQIO") {
         astarMQIO(graph, numNodes, sourceNode, targetNode, threadNum, queueNum, batchSizePop, batchSizePush, opt);
-    } else if (queueType == "MQIOPlain") {
+    } else if (algoType == "MQIOPlain") {
         astarMQIOPlain(graph, numNodes, sourceNode, targetNode, threadNum, queueNum);
-    // } else if (queueType == "MQBucket") {
+    // } else if (algoType == "MQBucket") {
     //     astarMQBucket(graph, numNodes, sourceNode, targetNode, 
     //         threadNum, queueNum, bucketNum, 
     //         batchSizePop, batchSizePush, opt);
+    } else if (algoType == "Serial") {
+        astarSerial(graph, numNodes, sourceNode, targetNode);
     } else {
-        std::cerr << "Unrecognized type: " << queueType << "\n";
+        std::cerr << "Unrecognized type: " << algoType << "\n";
         return 1;
     }
 
@@ -585,21 +637,30 @@ int main(int argc, const char** argv) {
     for (uint32_t i = 0; i < path.size()-1; i++) {
         uint64_t curDist_cm = neighDist(graph, path[i], path[i+1]);
         totalDist_cm += curDist_cm;
-        printf("%4d: %9ld -> %9ld | %8ld.%02ld m | %8ld.%02ld m\n", i, path[i], path[i+1],
-                curDist_cm / 100, curDist_cm % 100, totalDist_cm / 100, totalDist_cm % 100);
+        if (printFull)
+            printf("%4d: %9ld -> %9ld | %8ld.%02ld m | %8ld.%02ld m\n", i, path[i], path[i+1],
+                    curDist_cm / 100, curDist_cm % 100, totalDist_cm / 100, totalDist_cm % 100);
     }
-
+    printf("total distance: %8ld.%02ld m\n", totalDist_cm / 100, totalDist_cm % 100);
+            
     uint64_t directDist_cm = dist(&graph[sourceNode], &graph[targetNode]);
-    printf("As-the-crow-flies distance:                    %8ld.%02ld m\n", directDist_cm / 100, directDist_cm % 100);
+    printf("As-the-crow-flies distance: %8ld.%02ld m\n", directDist_cm / 100, directDist_cm % 100);
 
     // Save the path coordinates in binary
-    FILE* outFile = fopen("path.bin", "wb");
+    // FILE* outFile = fopen("path.bin", "wb");
+    // for (uint64_t vID : path) {
+    //     Vertex* v = &graph[vID];
+    //     fwrite(&v->lat, sizeof(double), 1, outFile);
+    //     fwrite(&v->lon, sizeof(double), 1, outFile);
+    // }
+    // fclose(outFile);
+    // Save the path in txt
+    std::ofstream outFile("path.txt");
     for (uint64_t vID : path) {
-        Vertex* v = &graph[vID];
-        fwrite(&v->lat, sizeof(double), 1, outFile);
-        fwrite(&v->lon, sizeof(double), 1, outFile);
+        outFile << vID << "\n";
     }
-    fclose(outFile);
+    outFile.close();
+
 
     return 0;
 }
