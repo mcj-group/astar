@@ -654,8 +654,13 @@ int main(int argc, const char** argv) {
     //     fwrite(&v->lon, sizeof(double), 1, outFile);
     // }
     // fclose(outFile);
+
     // Save the path in txt
     std::ofstream outFile("path.txt");
+    outFile << "start: " << sourceNode << "\n";
+    outFile << "target: " << targetNode << "\n";
+    outFile << "total distance: " << totalDist_cm / 100 << "." << totalDist_cm % 100 << "m\n";
+    outFile << "As-the-crow-flies distance: " << directDist_cm / 100 << "." << directDist_cm % 100 << "m\n";
     for (uint64_t vID : path) {
         outFile << vID << "\n";
     }
