@@ -26,6 +26,7 @@
 const double EarthRadius_cm = 637100000.0;
 constexpr static const unsigned MAX_PREFETCH = 64;
 constexpr static const unsigned MAX_PREFETCH_DEG = 1024;
+constexpr static uint64_t FSCORE_MASK = 0xffffffff;
 
 struct Vertex;
 
@@ -263,11 +264,14 @@ void astarMQIO(const Vertex* graph, uint32_t numNodes,
                 uint32_t batchSizePop, uint32_t batchSizePush, uint32_t opt)
 {
     MQ_IO wl(queueNum, threadNum, batchSizePop);
-    std::atomic<uint64_t> *prios = new std::atomic<uint64_t>[numNodes];
+    // union of 2x32bit
+    // | 63..32 | 31..0  |
+    // | parent | fscore |
+    std::atomic<uint64_t> *datas = new std::atomic<uint64_t>[numNodes];
     for (uint i = 0; i < numNodes; i++) {
-        prios[i].store(UINT64_MAX, std::memory_order_relaxed);
+        datas[i].store(UINT64_MAX, std::memory_order_relaxed);
     }
-    prios[sourceNode] = 0;
+    datas[sourceNode] = FSCORE_MASK << 32; // source has no parent
     wl.push(std::make_tuple(0, sourceNode));
 
     stat stats[threadNum];
@@ -282,7 +286,7 @@ void astarMQIO(const Vertex* graph, uint32_t numNodes,
         if (opt == 0) {
             std::thread *newThread = new std::thread(
                 MQIOThreadTask<true>, std::ref(graph), 
-                std::ref(wl), &stats[i], std::ref(prios),
+                std::ref(wl), &stats[i], std::ref(datas),
                 sourceNode, targetNode,
                 batchSizePop, batchSizePush
             );
@@ -295,7 +299,7 @@ void astarMQIO(const Vertex* graph, uint32_t numNodes,
         } else {
             std::thread *newThread = new std::thread(
                 MQIOThreadTask<false>, std::ref(graph), 
-                std::ref(wl), &stats[i], std::ref(prios),
+                std::ref(wl), &stats[i], std::ref(datas),
                 sourceNode, targetNode,
                 batchSizePop, batchSizePush
             );
@@ -311,10 +315,10 @@ void astarMQIO(const Vertex* graph, uint32_t numNodes,
     CPU_SET(0, &cpuset);
     sched_setaffinity(0, sizeof(cpuset), &cpuset);
     if (opt == 0) 
-        MQIOThreadTask<true>(graph, wl, &stats[0], prios, sourceNode, targetNode, 
+        MQIOThreadTask<true>(graph, wl, &stats[0], datas, sourceNode, targetNode, 
                                 batchSizePop, batchSizePush);
     else
-        MQIOThreadTask<false>(graph, wl, &stats[0], prios, sourceNode, targetNode, 
+        MQIOThreadTask<false>(graph, wl, &stats[0], datas, sourceNode, targetNode, 
                                 batchSizePop, batchSizePush);
     for (std::thread*& worker : workers) {
         worker->join();
@@ -332,7 +336,7 @@ void astarMQIO(const Vertex* graph, uint32_t numNodes,
 }
 
 void MQIOPlainThreadTask(Vertex* graph, MQ_IO &wl, stat *stats,
-                    std::atomic<uint64_t> *prios, 
+                    std::atomic<uint64_t> *datas, 
                     uint32_t sourceNode, uint32_t targetNode)
 {
     uint32_t iter = 0UL;
@@ -345,35 +349,35 @@ void MQIOPlainThreadTask(Vertex* graph, MQ_IO &wl, stat *stats,
         if (item) std::tie(gScore, src) = item.get();
         else break;
 
-        uint64_t targetDist = prios[targetNode].load(std::memory_order_relaxed);
+        uint64_t targetData = datas[targetNode].load(std::memory_order_relaxed);
+        uint32_t targetDist = targetData & FSCORE_MASK;
 #ifdef PERF
-        uint64_t fScore = getPrioData(&prios[src]);
+        uint64_t srcData = getPrioData(&datas[src]);
 #else
-        uint64_t fScore = prios[src].load(std::memory_order_relaxed);
+        uint64_t srcData = datas[src].load(std::memory_order_relaxed);
 #endif
+        uint32_t fScore = srcData & FSCORE_MASK;
         ++iter;
-        // if (srcF < fScore) {
-        //     emptyWork++;
-        //     continue;
-        // }
 
         for (uint32_t e = 0; e < graph[src].adj.size(); e++) {
             auto& adjNode = graph[src].adj[e];
             uint32_t dst = adjNode.n;
             uint32_t nFScore = fScore + adjNode.d_cm;
             uint32_t nGScore = std::max(gScore, nFScore + dist(&graph[dst], &graph[targetNode]));
-            if (targetDist != UINT64_MAX && nFScore > targetDist) continue;              
-            uint64_t d = prios[dst].load(std::memory_order_relaxed);
+            if (targetDist != UINT32_MAX && nFScore > targetDist) continue;              
+            uint64_t dstData = datas[dst].load(std::memory_order_relaxed);
             bool swapped = false;
             do {
-                if (d <= nFScore) break;
-                swapped = prios[dst].compare_exchange_weak(
-                    d, nFScore,
+                uint32_t dstDist = dstData & FSCORE_MASK;
+                if (dstDist <= nFScore) break;
+                uint64_t srcShift = src;
+                uint64_t swapVal = (srcShift << 32) | nFScore;
+                swapped = datas[dst].compare_exchange_weak(
+                    dstData, swapVal,
                     std::memory_order_release,
                     std::memory_order_relaxed);
             } while(!swapped);
             if (!swapped) continue;
-            graph[dst].prev = src;
             wl.push({nGScore, dst});
         }
     }
@@ -387,11 +391,14 @@ void astarMQIOPlain(Vertex* graph, uint32_t numNodes,
                 uint32_t threadNum, uint32_t queueNum)
 {
     MQ_IO wl(queueNum, threadNum, 1);
-    std::atomic<uint64_t> *prios = new std::atomic<uint64_t>[numNodes];
+    // union of 2x32bit
+    // | 63..32 | 31..0  |
+    // | parent | fscore |
+    std::atomic<uint64_t> *datas = new std::atomic<uint64_t>[numNodes];
     for (uint i = 0; i < numNodes; i++) {
-        prios[i].store(UINT64_MAX, std::memory_order_relaxed);
+        datas[i].store(UINT64_MAX, std::memory_order_relaxed);
     }
-    prios[sourceNode] = 0;
+    datas[sourceNode] = FSCORE_MASK << 32; // source has no parent
     wl.push(std::make_tuple(0, sourceNode));
 
     stat stats[threadNum];
@@ -405,7 +412,7 @@ void astarMQIOPlain(Vertex* graph, uint32_t numNodes,
         CPU_SET(coreID, &cpuset);
         std::thread *newThread = new std::thread(
             MQIOPlainThreadTask, std::ref(graph), 
-            std::ref(wl), &stats[i], std::ref(prios),
+            std::ref(wl), &stats[i], std::ref(datas),
             sourceNode, targetNode
         );
         int rc = pthread_setaffinity_np(newThread->native_handle(),
@@ -418,7 +425,7 @@ void astarMQIOPlain(Vertex* graph, uint32_t numNodes,
     CPU_ZERO(&cpuset);
     CPU_SET(0, &cpuset);
     sched_setaffinity(0, sizeof(cpuset), &cpuset);
-    MQIOPlainThreadTask(graph, wl, &stats[0], prios, sourceNode, targetNode);
+    MQIOPlainThreadTask(graph, wl, &stats[0], datas, sourceNode, targetNode);
     for (std::thread*& worker : workers) {
         worker->join();
         delete worker;
@@ -432,6 +439,14 @@ void astarMQIOPlain(Vertex* graph, uint32_t numNodes,
 
     wl.stat();
     std::cout << "runtime_ms " << ms << "\n";
+
+    // trace back the path
+    uint32_t cur = targetNode;
+    while (cur != sourceNode) {
+        uint32_t parent = datas[cur].load(std::memory_order_relaxed) >> 32;
+        graph[cur].prev = parent;
+        cur = parent;
+    }
 }
 
 void astarSerial(Vertex* graph, uint32_t numNodes, 
