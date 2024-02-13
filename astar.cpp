@@ -143,47 +143,56 @@ uint32_t dist(const Vertex* src, const Vertex* dst) {
 }
 
 #ifdef PERF
-uint32_t __attribute__ ((noinline)) filter(std::atomic<uint64_t> *prios, PQElement* pushBatch, uint32_t pushSize) {
+uint32_t __attribute__ ((noinline)) filter(
+    std::atomic<uint64_t> *datas, PQElement* pushBatch, 
+    PQElement* pushBatchSrcs, uint32_t pushSize) {
 #else
-inline uint32_t filter(std::atomic<uint64_t> *prios, PQElement* pushBatch, uint32_t pushSize) {
+inline uint32_t filter(
+    std::atomic<uint64_t> *datas, PQElement* pushBatch, 
+    PQElement* pushBatchSrcs, uint32_t pushSize) {
 #endif
-  uint32_t k = 0;
-  for (uint32_t i = 0; i < pushSize; i++) {
-    uint32_t nd = std::get<0>(pushBatch[i]);
-    uint32_t v = std::get<1>(pushBatch[i]);
+    uint32_t k = 0;
+    for (uint32_t i = 0; i < pushSize; i++) {
+        uint32_t nGScore = std::get<0>(pushBatch[i]);
+        uint32_t dst = std::get<1>(pushBatch[i]);
+        uint32_t nFScore = std::get<0>(pushBatchSrcs[i]);
+        uint32_t src = std::get<1>(pushBatchSrcs[i]);
 #ifdef PERF
-    uint64_t d = getPrioData(&prios[v]);
+        uint64_t dstData = getPrioData(&datas[v]);
 #else
-    uint64_t d = prios[v].load(std::memory_order_relaxed);
+        uint64_t dstData = datas[dst].load(std::memory_order_relaxed);
 #endif
-    bool swapped = false;
-    do {
-      if (d <= nd) break;
-      swapped = prios[v].compare_exchange_weak(
-          d, nd,
-          std::memory_order_release,
-          std::memory_order_relaxed);
-    } while(!swapped);
-    if (!swapped) continue;
-
-    std::get<0>(pushBatch[k]) = nd;
-    std::get<1>(pushBatch[k]) = v;
-    k++;
-  }
-  return k;
+        bool swapped = false;
+        do {
+            uint32_t dstDist = dstData & FSCORE_MASK;
+            if (dstDist <= nFScore) break;
+            uint64_t shift = src;
+            uint64_t swapVal = (shift << 32) | nFScore;
+            swapped = datas[dst].compare_exchange_weak(
+                dstData, swapVal,
+                std::memory_order_release,
+                std::memory_order_relaxed);
+        } while(!swapped);
+        if (!swapped) continue;
+        std::get<0>(pushBatch[k]) = nGScore;
+        std::get<1>(pushBatch[k]) = dst;
+        k++;
+    }
+    return k;
 }
 
 template<bool usePrefetch=true>
 void MQIOThreadTask(const Vertex* graph, MQ_IO &wl, stat *stats,
-                    std::atomic<uint64_t> *prios, 
+                    std::atomic<uint64_t> *datas, 
                     uint32_t sourceNode, uint32_t targetNode,
                     uint32_t batchSizePop, uint32_t batchSizePush) {
     uint32_t iter = 0UL;
     uint32_t emptyWork = 0UL;
-    uint32_t srcDist;
+    uint32_t gScore;
     uint32_t src;
     PQElement* popBatch = new PQElement[batchSizePop];
     PQElement* pushBatch = new PQElement[batchSizePush];
+    PQElement* pushBatchSrcs = new PQElement[batchSizePush];
 
     while (true) {
         uint32_t prefetchIdx;
@@ -196,12 +205,12 @@ void MQIOThreadTask(const Vertex* graph, MQ_IO &wl, stat *stats,
             for (prefetchIdx = 0; prefetchIdx < size && prefetchIdx < MAX_PREFETCH; prefetchIdx++) {
                 uint32_t v = std::get<1>(popBatch[prefetchIdx]);
                 if (graph[v].adj.size() > MAX_PREFETCH_DEG) continue;
-                __builtin_prefetch(&prios[v], 0, 3);
+                __builtin_prefetch(&datas[v], 0, 3);
             }
         }
 
-
-        uint32_t targetDist = prios[targetNode].load(std::memory_order_relaxed);
+        uint64_t targetData = datas[targetNode].load(std::memory_order_relaxed);
+        uint32_t targetDist = targetData & FSCORE_MASK;
         uint32_t idx = 0;
         for (uint32_t i = 0; i < size; i++) {
             if (usePrefetch) {
@@ -210,36 +219,36 @@ void MQIOThreadTask(const Vertex* graph, MQ_IO &wl, stat *stats,
                     for (; prefetchIdx < size && prefetchIdx < end; prefetchIdx++) {
                         uint32_t v = std::get<1>(popBatch[prefetchIdx]);
                         if (graph[v].adj.size() > MAX_PREFETCH_DEG) continue;
-                        __builtin_prefetch(&prios[v], 0, 3);
+                        __builtin_prefetch(&datas[v], 0, 3);
                     }
                 }
             }
 
-            std::tie(srcDist, src) = popBatch[i];
+            std::tie(gScore, src) = popBatch[i];
 #ifdef PERF
-            uint64_t srcD = getPrioData(&prios[src]);
+            uint64_t srcData = getPrioData(&datas[src]);
 #else
-            uint64_t srcD = prios[src].load(std::memory_order_relaxed);
+            uint64_t srcData = datas[src].load(std::memory_order_relaxed);
 #endif
+            uint32_t fScore = srcData & FSCORE_MASK;
             ++iter;
-            if (srcD < srcDist) {
-                emptyWork++;
-                continue;
-            }
 
             for (uint32_t e = 0; e < graph[src].adj.size(); e++) {
-                uint32_t dst = graph[src].adj[e].n;
-                uint32_t newDist = srcDist + dist(&graph[src], &graph[dst]);
-                if (targetDist != UINT64_MAX && newDist > targetDist) continue;              
-                pushBatch[idx] = {newDist, dst};
+                auto& adjNode = graph[src].adj[e];
+                uint32_t dst = adjNode.n;
+                uint32_t nFScore = fScore + adjNode.d_cm;
+                uint32_t nGScore = std::max(gScore, nFScore + dist(&graph[dst], &graph[targetNode]));
+                if (targetDist != UINT32_MAX && nFScore > targetDist) continue;          
+                pushBatch[idx] = {nGScore, dst};
+                pushBatchSrcs[idx] = {nFScore, src};
                 if (usePrefetch) {
-                    if (graph[dst].adj.size() < MAX_PREFETCH_DEG)
-                    __builtin_prefetch(&prios[dst], 0, 3);
+                    if (graph[dst].adj.size() > MAX_PREFETCH_DEG) continue;
+                    __builtin_prefetch(&datas[dst], 0, 3);
                 }
 
                 idx++;
                 if (idx == batchSizePush) {
-                    uint32_t k = filter(prios, pushBatch, idx);
+                    uint32_t k = filter(datas, pushBatch, pushBatchSrcs, idx);
                     if (k != 0) wl.pushBatch(k, pushBatch);
                     idx = 0;
                 }
@@ -247,18 +256,19 @@ void MQIOThreadTask(const Vertex* graph, MQ_IO &wl, stat *stats,
         }
 
         if (idx > 0) {
-            uint32_t k = filter(prios, pushBatch, idx);
+            uint32_t k = filter(datas, pushBatch, pushBatchSrcs, idx);
             if (k != 0) wl.pushBatch(k, pushBatch);
         }
     }
 
-    delete [] pushBatch;
     delete [] popBatch;
+    delete [] pushBatch;
+    delete [] pushBatchSrcs;
     stats->iter = iter;
     stats->emptyWork = emptyWork;
 }
 
-void astarMQIO(const Vertex* graph, uint32_t numNodes, 
+void astarMQIO(Vertex* graph, uint32_t numNodes, 
                 uint32_t sourceNode, uint32_t targetNode, 
                 uint32_t threadNum, uint32_t queueNum, 
                 uint32_t batchSizePop, uint32_t batchSizePush, uint32_t opt)
@@ -333,9 +343,17 @@ void astarMQIO(const Vertex* graph, uint32_t numNodes,
 
     wl.stat();
     std::cout << "runtime_ms " << ms << "\n";
+
+    // trace back the path for verification
+    uint32_t cur = targetNode;
+    while (cur != sourceNode) {
+        uint32_t parent = datas[cur].load(std::memory_order_relaxed) >> 32;
+        graph[cur].prev = parent;
+        cur = parent;
+    }
 }
 
-void MQIOPlainThreadTask(Vertex* graph, MQ_IO &wl, stat *stats,
+void MQIOPlainThreadTask(const Vertex* graph, MQ_IO &wl, stat *stats,
                     std::atomic<uint64_t> *datas, 
                     uint32_t sourceNode, uint32_t targetNode)
 {
@@ -440,7 +458,7 @@ void astarMQIOPlain(Vertex* graph, uint32_t numNodes,
     wl.stat();
     std::cout << "runtime_ms " << ms << "\n";
 
-    // trace back the path
+    // trace back the path for verification
     uint32_t cur = targetNode;
     while (cur != sourceNode) {
         uint32_t parent = datas[cur].load(std::memory_order_relaxed) >> 32;
@@ -523,7 +541,7 @@ int main(int argc, const char** argv) {
     uint32_t batchSizePop = atol(argv[8]);
     uint32_t batchSizePush = atol(argv[9]);
     uint32_t opt = atol(argv[10]);
-    uint32_t printFull = atol(argv[10]);
+    uint32_t printFull = atol(argv[11]);
     printf("Finding shortest path between nodes %d and %d\n", sourceNode, targetNode);
     printf("Type: %s\n", algoType.c_str());
     printf("Threads: %d\n", threadNum);
