@@ -237,8 +237,8 @@ void MQIOThreadTask(const Vertex* graph, MQ_IO &wl, stat *stats,
                 auto& adjNode = graph[src].adj[e];
                 uint32_t dst = adjNode.n;
                 uint32_t nFScore = fScore + adjNode.d_cm;
-                uint32_t nGScore = std::max(gScore, nFScore + dist(&graph[dst], &graph[targetNode]));
                 if (targetDist != UINT32_MAX && nFScore > targetDist) continue;          
+                uint32_t nGScore = std::max(gScore, nFScore + dist(&graph[dst], &graph[targetNode]));
                 pushBatch[idx] = {nGScore, dst};
                 pushBatchSrcs[idx] = {nFScore, src};
                 if (usePrefetch) {
@@ -381,7 +381,6 @@ void MQIOPlainThreadTask(const Vertex* graph, MQ_IO &wl, stat *stats,
             auto& adjNode = graph[src].adj[e];
             uint32_t dst = adjNode.n;
             uint32_t nFScore = fScore + adjNode.d_cm;
-            uint32_t nGScore = std::max(gScore, nFScore + dist(&graph[dst], &graph[targetNode]));
             if (targetDist != UINT32_MAX && nFScore > targetDist) continue;              
             uint64_t dstData = datas[dst].load(std::memory_order_relaxed);
             bool swapped = false;
@@ -396,6 +395,7 @@ void MQIOPlainThreadTask(const Vertex* graph, MQ_IO &wl, stat *stats,
                     std::memory_order_relaxed);
             } while(!swapped);
             if (!swapped) continue;
+            uint32_t nGScore = std::max(gScore, nFScore + dist(&graph[dst], &graph[targetNode]));
             wl.push({nGScore, dst});
         }
     }
@@ -563,8 +563,8 @@ void MQBucketThreadTask(const Vertex* graph, MQ_Bucket &wl, stat *stats,
                 auto& adjNode = graph[src].adj[e];
                 uint32_t dst = adjNode.n;
                 uint32_t nFScore = fScore + adjNode.d_cm;
-                uint32_t nGScore = nFScore + dist(&graph[dst], &graph[targetNode]);
                 if (targetDist != UINT32_MAX && nFScore > targetDist) continue;          
+                uint32_t nGScore = nFScore + dist(&graph[dst], &graph[targetNode]);
                 pushBatch[idx] = {nGScore >> delta, dst};
                 pushBatchSrcs[idx] = {nFScore, src};
                 if (usePrefetch) {
@@ -619,13 +619,11 @@ void MQBucketThreadTaskBase(const Vertex* graph, MQ_Bucket &wl, stat *stats,
 #endif
         uint32_t fScore = srcData & FSCORE_MASK;
         ++iter;
-        if (iter % 10000 ==0) std::cout << iter << "\n";
 
         for (uint32_t e = 0; e < graph[src].adj.size(); e++) {
             auto& adjNode = graph[src].adj[e];
             uint32_t dst = adjNode.n;
             uint32_t nFScore = fScore + adjNode.d_cm;
-            uint32_t nGScore = nFScore + dist(&graph[dst], &graph[targetNode]);
             if (targetDist != UINT32_MAX && nFScore > targetDist) continue;              
             uint64_t dstData = datas[dst].load(std::memory_order_relaxed);
             bool swapped = false;
@@ -640,6 +638,7 @@ void MQBucketThreadTaskBase(const Vertex* graph, MQ_Bucket &wl, stat *stats,
                     std::memory_order_relaxed);
             } while(!swapped);
             if (!swapped) continue;
+            uint32_t nGScore = nFScore + dist(&graph[dst], &graph[targetNode]);
             wl.pushSingle(nGScore >> delta, dst);
         }
     }
@@ -790,10 +789,10 @@ void astarSerial(Vertex* graph, uint32_t numNodes,
             auto& adjNode = graph[src].adj[e];
             uint32_t dst = adjNode.n;
             uint32_t nFScore = fScore + adjNode.d_cm;
-            uint32_t nGScore = std::max(gScore, nFScore + dist(&graph[dst], &graph[targetNode]));
-            if (targetDist != UINT64_MAX && nFScore > targetDist) continue;              
+            if (targetDist != UINT32_MAX && nFScore > targetDist) continue;              
             uint32_t d = prios[dst];
             if (d <= nFScore) continue;
+            uint32_t nGScore = std::max(gScore, nFScore + dist(&graph[dst], &graph[targetNode]));
             prios[dst] = nFScore;
             graph[dst].prev = src;
             wl.push({nGScore, dst});
