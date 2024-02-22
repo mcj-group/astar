@@ -10,6 +10,7 @@
 #include <thread>
 
 #include "BucketQueueTryLock.h"
+#include "BucketStructs.h"
 #include "MultiQueueIO.h"
 
 /* dsm: A*-search for road maps. Conventions:
@@ -27,6 +28,7 @@ const double EarthRadius_cm = 637100000.0;
 constexpr static const unsigned MAX_PREFETCH = 64;
 constexpr static const unsigned MAX_PREFETCH_DEG = 1024;
 constexpr static uint64_t FSCORE_MASK = 0xffffffff;
+constexpr static bucket_id UNDER_BKT = INT64_MAX - 1;
 
 struct Vertex;
 
@@ -557,6 +559,7 @@ void MQBucketThreadTask(const Vertex* graph, MQ_Bucket &wl, stat *stats,
             uint64_t srcData = datas[src].load(std::memory_order_relaxed);
 #endif
             uint32_t fScore = srcData & FSCORE_MASK;
+            uint32_t gScore = (poppedBkt == UNDER_BKT) ? fScore : (poppedBkt << delta);
             ++iter;
 
             for (uint32_t e = 0; e < graph[src].adj.size(); e++) {
@@ -564,7 +567,7 @@ void MQBucketThreadTask(const Vertex* graph, MQ_Bucket &wl, stat *stats,
                 uint32_t dst = adjNode.n;
                 uint32_t nFScore = fScore + adjNode.d_cm;
                 if (targetDist != UINT32_MAX && nFScore > targetDist) continue;          
-                uint32_t nGScore = nFScore + dist(&graph[dst], &graph[targetNode]);
+                uint32_t nGScore = std::max(gScore, nFScore + dist(&graph[dst], &graph[targetNode]));
                 pushBatch[idx] = {nGScore >> delta, dst};
                 pushBatchSrcs[idx] = {nFScore, src};
                 if (usePrefetch) {
@@ -618,6 +621,7 @@ void MQBucketThreadTaskBase(const Vertex* graph, MQ_Bucket &wl, stat *stats,
         uint64_t srcData = datas[src].load(std::memory_order_relaxed);
 #endif
         uint32_t fScore = srcData & FSCORE_MASK;
+        uint32_t gScore = (poppedBkt == UNDER_BKT) ? fScore : (poppedBkt << delta);
         ++iter;
 
         for (uint32_t e = 0; e < graph[src].adj.size(); e++) {
@@ -638,7 +642,7 @@ void MQBucketThreadTaskBase(const Vertex* graph, MQ_Bucket &wl, stat *stats,
                     std::memory_order_relaxed);
             } while(!swapped);
             if (!swapped) continue;
-            uint32_t nGScore = nFScore + dist(&graph[dst], &graph[targetNode]);
+            uint32_t nGScore = std::max(gScore, nFScore + dist(&graph[dst], &graph[targetNode]));
             wl.pushSingle(nGScore >> delta, dst);
         }
     }
@@ -777,7 +781,9 @@ void astarSerial(Vertex* graph, uint32_t numNodes,
     uint32_t gScore;
     uint32_t src;
     uint32_t iter = 0;
+    uint32_t maxSize = 0;
     while (!wl.empty()) {
+        if (wl.size() > maxSize) maxSize = wl.size();
         std::tie(gScore, src) = wl.top();
         wl.pop();
 
@@ -804,6 +810,7 @@ void astarSerial(Vertex* graph, uint32_t numNodes,
     auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(end-begin).count();
     std::cout << "runtime_ms " << ms << "\n";
     std::cout << "iter " << iter << "\n";
+    std::cout << "max size " << maxSize << "\n";
 }
 
 uint32_t neighDist(Vertex* graph, uint32_t v, uint32_t w) {
