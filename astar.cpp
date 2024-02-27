@@ -172,8 +172,8 @@ inline uint32_t filter(
             uint64_t swapVal = (shift << 32) | nFScore;
             swapped = datas[dst].compare_exchange_weak(
                 dstData, swapVal,
-                std::memory_order_release,
-                std::memory_order_relaxed);
+                std::memory_order_acq_rel,
+                std::memory_order_acquire);
         } while(!swapped);
         if (!swapped) continue;
         std::get<0>(pushBatch[k]) = nGScore;
@@ -393,8 +393,8 @@ void MQIOPlainThreadTask(const Vertex* graph, MQ_IO &wl, stat *stats,
                 uint64_t swapVal = (srcShift << 32) | nFScore;
                 swapped = datas[dst].compare_exchange_weak(
                     dstData, swapVal,
-                    std::memory_order_release,
-                    std::memory_order_relaxed);
+                    std::memory_order_acq_rel,
+                    std::memory_order_acquire);
             } while(!swapped);
             if (!swapped) continue;
             uint32_t nGScore = std::max(gScore, nFScore + dist(&graph[dst], &graph[targetNode]));
@@ -497,8 +497,8 @@ inline uint32_t CASfilter(
             uint64_t swapVal = (shift << 32) | nFScore;
             swapped = datas[dst].compare_exchange_weak(
                 dstData, swapVal,
-                std::memory_order_release,
-                std::memory_order_relaxed);
+                std::memory_order_acq_rel,
+                std::memory_order_acquire);
         } while(!swapped);
         if (!swapped) continue;
         std::get<0>(pushBatch[k]) = bkt;
@@ -638,8 +638,8 @@ void MQBucketThreadTaskBase(const Vertex* graph, MQ_Bucket &wl, stat *stats,
                 uint64_t swapVal = (srcShift << 32) | nFScore;
                 swapped = datas[dst].compare_exchange_weak(
                     dstData, swapVal,
-                    std::memory_order_release,
-                    std::memory_order_relaxed);
+                    std::memory_order_acq_rel,
+                    std::memory_order_acquire);
             } while(!swapped);
             if (!swapped) continue;
             uint32_t nGScore = std::max(gScore, nFScore + dist(&graph[dst], &graph[targetNode]));
