@@ -559,7 +559,9 @@ void MQBucketThreadTask(const Vertex* graph, MQ_Bucket &wl, stat *stats,
             uint64_t srcData = datas[src].load(std::memory_order_relaxed);
 #endif
             uint32_t fScore = srcData & FSCORE_MASK;
-            uint32_t gScore = (poppedBkt == UNDER_BKT) ? fScore : (poppedBkt << delta);
+            uint32_t gScore = (poppedBkt == UNDER_BKT)
+                ? (fScore + dist(&graph[src], &graph[targetNode]))
+                : (poppedBkt << delta);
             ++iter;
 
             for (uint32_t e = 0; e < graph[src].adj.size(); e++) {
@@ -621,7 +623,9 @@ void MQBucketThreadTaskBase(const Vertex* graph, MQ_Bucket &wl, stat *stats,
         uint64_t srcData = datas[src].load(std::memory_order_relaxed);
 #endif
         uint32_t fScore = srcData & FSCORE_MASK;
-        uint32_t gScore = (poppedBkt == UNDER_BKT) ? fScore : (poppedBkt << delta);
+        uint32_t gScore = (poppedBkt == UNDER_BKT)
+            ? (fScore + dist(&graph[src], &graph[targetNode]))
+            : (poppedBkt << delta);
         ++iter;
 
         for (uint32_t e = 0; e < graph[src].adj.size(); e++) {
