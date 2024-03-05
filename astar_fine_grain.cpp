@@ -55,7 +55,7 @@ struct Vertex {
 };
 
 using PQElement = std::tuple<uint32_t, uint64_t>;
-using BktElement = std::tuple<bucket_id, uint32_t>;
+using BktElement = std::tuple<bucket_id, uint64_t>;
 using MQ_IO = MultiQueueIO<std::greater<PQElement>, uint32_t, uint64_t>;
 struct stat {
   uint32_t iterVisit = 0;
@@ -498,302 +498,183 @@ void astarMQIOPlain(Vertex* graph, uint32_t numNodes,
     }
 }
 
-// #ifdef PERF
-// uint32_t __attribute__ ((noinline)) CASfilter(
-//     std::atomic<uint64_t> *datas, BktElement* pushBatch, 
-//     PQElement* pushBatchSrcs, uint32_t pushSize) {
-// #else
-// inline uint32_t CASfilter(
-//     std::atomic<uint64_t> *datas, BktElement* pushBatch, 
-//     PQElement* pushBatchSrcs, uint32_t pushSize) {
-// #endif
-//     uint32_t k = 0;
-//     for (uint32_t i = 0; i < pushSize; i++) {
-//         bucket_id bkt = std::get<0>(pushBatch[i]);
-//         uint32_t dst = std::get<1>(pushBatch[i]);
-//         uint32_t nFScore = std::get<0>(pushBatchSrcs[i]);
-//         uint32_t src = std::get<1>(pushBatchSrcs[i]);
-// #ifdef PERF
-//         uint64_t dstData = getPrioData(&datas[v]);
-// #else
-//         uint64_t dstData = datas[dst].load(std::memory_order_relaxed);
-// #endif
-//         bool swapped = false;
-//         do {
-//             uint32_t dstDist = dstData & BOTTOM32_MASK;
-//             if (dstDist <= nFScore) break;
-//             uint64_t shift = src;
-//             uint64_t swapVal = (shift << 32) | nFScore;
-//             swapped = datas[dst].compare_exchange_weak(
-//                 dstData, swapVal,
-//                 std::memory_order_acq_rel,
-//                 std::memory_order_acquire);
-//         } while(!swapped);
-//         if (!swapped) continue;
-//         std::get<0>(pushBatch[k]) = bkt;
-//         std::get<1>(pushBatch[k]) = dst;
-//         k++;
-//     }
-//     return k;
-// }
 
-// template<bool usePrefetch=true, typename MQ_Bucket>
-// void MQBucketThreadTask(const Vertex* graph, MQ_Bucket &wl, stat *stats,
-//                     std::atomic<uint64_t> *datas, 
-//                     uint32_t sourceNode, uint32_t targetNode, uint32_t delta,
-//                     uint32_t batchSizePop, uint32_t batchSizePush) {
-//     uint32_t iter = 0UL;
-//     uint32_t emptyWork = 0UL;
-//     uint32_t gScore;
-//     uint32_t src;
-//     uint32_t* popBatch = new uint32_t[batchSizePop];
-//     BktElement* pushBatch = new BktElement[batchSizePush];
-//     PQElement* pushBatchSrcs = new PQElement[batchSizePush];
+template<typename MQ_Bucket>
+void MQBucketThreadTaskBase(const Vertex* graph, MQ_Bucket &wl, stat *stats,
+                    std::atomic<uint64_t> *datas, 
+                    uint32_t sourceNode, uint32_t targetNode, uint32_t delta) {
+    uint32_t iterVisit = 0;
+    uint32_t iterCompute = 0;
+    uint32_t emptyWork = 0UL;
+    uint64_t task;
+    bucket_id poppedBkt;
 
-//     while (true) {
-//         uint32_t prefetchIdx;
-//         auto item = wl.tryPopBatch(popBatch);
-//         uint32_t size;
-//         bucket_id poppedBkt;
-//         if (item) std::tie(size, poppedBkt) = item.get();
-//         else break;
+    while (true) {
+        auto item = wl.tryPopSingle();
+        if (item) std::tie(task, poppedBkt) = item.get();
+        else break;
 
-//         if (usePrefetch) {
-//             for (prefetchIdx = 0; prefetchIdx < size && prefetchIdx < MAX_PREFETCH; prefetchIdx++) {
-//                 uint32_t v = popBatch[prefetchIdx];
-//                 if (graph[v].adj.size() > MAX_PREFETCH_DEG) continue;
-//                 __builtin_prefetch(&datas[v], 0, 3);
-//             }
-//         }
+        uint32_t vertex = task >> 32;
+        uint32_t data = task & BOTTOM32_MASK;
 
-//         uint64_t targetData = datas[targetNode].load(std::memory_order_relaxed);
-//         uint32_t targetDist = targetData & BOTTOM32_MASK;
-//         uint32_t idx = 0;
-//         for (uint32_t i = 0; i < size; i++) {
-//             if (usePrefetch) {
-//                 if (i > 0 && (i % MAX_PREFETCH == 0)) {
-//                     uint32_t end = prefetchIdx + MAX_PREFETCH;
-//                     for (; prefetchIdx < size && prefetchIdx < end; prefetchIdx++) {
-//                         uint32_t v = popBatch[prefetchIdx];
-//                         if (graph[v].adj.size() > MAX_PREFETCH_DEG) continue;
-//                         __builtin_prefetch(&datas[v], 0, 3);
-//                     }
-//                 }
-//             }
+        if (data & COMPUTE_TASK_BIT) {
+            ++iterCompute;
+            uint32_t nFScore = data & VERTEX_ID_MASK;
+            uint32_t gScore = poppedBkt << delta;
+            uint32_t nGScore = std::max(gScore, nFScore + dist(&graph[vertex], &graph[targetNode]));
+            uint64_t n = vertex;
+            wl.pushSingle(nGScore >> delta, n << 32);
 
-//             src = popBatch[i];
-// #ifdef PERF
-//             uint64_t srcData = getPrioData(&datas[src]);
-// #else
-//             uint64_t srcData = datas[src].load(std::memory_order_relaxed);
-// #endif
-//             uint32_t fScore = srcData & BOTTOM32_MASK;
-//             uint32_t gScore = (poppedBkt == UNDER_BKT)
-//                 ? (fScore + dist(&graph[src], &graph[targetNode]))
-//                 : (poppedBkt << delta);
-//             ++iter;
+        } else {
+            ++iterVisit;
+            uint64_t targetData = datas[targetNode].load(std::memory_order_relaxed);
+            uint32_t targetDist = targetData & BOTTOM32_MASK;
+            uint64_t srcData = datas[vertex].load(std::memory_order_relaxed);
+            uint32_t fScore = srcData & BOTTOM32_MASK;
 
-//             for (uint32_t e = 0; e < graph[src].adj.size(); e++) {
-//                 auto& adjNode = graph[src].adj[e];
-//                 uint32_t dst = adjNode.n;
-//                 uint32_t nFScore = fScore + adjNode.d_cm;
-//                 if (targetDist != UINT32_MAX && nFScore > targetDist) continue;          
-//                 uint32_t nGScore = std::max(gScore, nFScore + dist(&graph[dst], &graph[targetNode]));
-//                 pushBatch[idx] = {nGScore >> delta, dst};
-//                 pushBatchSrcs[idx] = {nFScore, src};
-//                 if (usePrefetch) {
-//                     if (graph[dst].adj.size() > MAX_PREFETCH_DEG) continue;
-//                     __builtin_prefetch(&datas[dst], 0, 3);
-//                 }
+            for (uint32_t e = 0; e < graph[vertex].adj.size(); e++) {
+                auto& adjNode = graph[vertex].adj[e];
+                uint32_t dst = adjNode.n;
+                uint32_t nFScore = fScore + adjNode.d_cm;
+                if (targetDist != UINT32_MAX && nFScore > targetDist) continue;              
+                uint64_t dstData = datas[dst].load(std::memory_order_relaxed);
+                bool swapped = false;
+                do {
+                    uint32_t dstDist = dstData & BOTTOM32_MASK;
+                    if (dstDist <= nFScore) break;
+                    uint64_t srcShift = vertex;
+                    uint64_t swapVal = (srcShift << 32) | nFScore;
+                    swapped = datas[dst].compare_exchange_weak(
+                        dstData, swapVal,
+                        std::memory_order_acq_rel,
+                        std::memory_order_acquire);
+                } while(!swapped);
+                if (!swapped) continue;
+                uint64_t n = dst;
+                wl.pushSingle(poppedBkt, (n << 32 | nFScore | COMPUTE_TASK_BIT));
 
-//                 idx++;
-//                 if (idx == batchSizePush) {
-//                     uint32_t k = CASfilter(datas, pushBatch, pushBatchSrcs, idx);
-//                     if (k != 0) wl.pushBatch(k, pushBatch);
-//                     idx = 0;
-//                 }
-//             }
-//         }
+            }
+        }
+    }
 
-//         if (idx > 0) {
-//             uint32_t k = CASfilter(datas, pushBatch, pushBatchSrcs, idx);
-//             if (k != 0) wl.pushBatch(k, pushBatch);
-//         }
-//     }
+    stats->iterVisit = iterVisit;
+    stats->iterCompute = iterCompute;
+    stats->emptyWork = emptyWork;
+}
 
-//     delete [] popBatch;
-//     delete [] pushBatch;
-//     delete [] pushBatchSrcs;
-//     stats->iter = iter;
-//     stats->emptyWork = emptyWork;
-// }
+void astarMQBucket(Vertex* graph, uint32_t numNodes, 
+                uint32_t sourceNode, uint32_t targetNode, 
+                uint32_t threadNum, uint32_t queueNum, uint32_t bucketNum,
+                uint32_t batchSizePop, uint32_t batchSizePush,
+                uint32_t opt, uint32_t delta)
+{
+    // union of 2x32bit
+    // | 63..32 | 31..0  |
+    // | parent | fscore |
+    std::atomic<uint64_t> *datas = new std::atomic<uint64_t>[numNodes];
+    for (uint i = 0; i < numNodes; i++) {
+        datas[i].store(UINT64_MAX, std::memory_order_relaxed);
+    }
+    datas[sourceNode] = BOTTOM32_MASK << 32; // source has no parent
 
-// template<typename MQ_Bucket>
-// void MQBucketThreadTaskBase(const Vertex* graph, MQ_Bucket &wl, stat *stats,
-//                     std::atomic<uint64_t> *datas, 
-//                     uint32_t sourceNode, uint32_t targetNode, uint32_t delta) {
-//     uint32_t iter = 0UL;
-//     uint32_t emptyWork = 0UL;
-//     uint32_t src;
-//     bucket_id poppedBkt;
+    std::function<bucket_id(uint64_t)> getBucketID = [&] (uint64_t task) -> bucket_id {
+        uint32_t v = task >> 32;
+        uint64_t d = datas[v].load(std::memory_order_acquire);
+        uint32_t fScore = d & BOTTOM32_MASK;
+        uint32_t gScore = fScore + dist(&graph[v], &graph[targetNode]);
+        return bucket_id(gScore) >> delta;
+    };
+    using MQ_Bucket = BucketMultiQueueIO<decltype(getBucketID), std::greater<bucket_id>, uint32_t, uint64_t>;
+    MQ_Bucket wl(getBucketID, queueNum, threadNum, delta, bucketNum, batchSizePop, increasing);
+    uint64_t node = sourceNode;
+    bucket_id b = bucket_id(dist(&graph[sourceNode], &graph[targetNode])) >> delta;
+    wl.push(b, node << 32);
 
-//     while (true) {
-//         uint32_t prefetchIdx;
-//         auto item = wl.tryPopSingle();
-//         if (item) std::tie(src, poppedBkt) = item.get();
-//         else break;
+    stat stats[threadNum];
 
-//         uint64_t targetData = datas[targetNode].load(std::memory_order_relaxed);
-//         uint32_t targetDist = targetData & BOTTOM32_MASK;
-//         uint32_t idx = 0;
-// #ifdef PERF
-//         uint64_t srcData = getPrioData(&datas[src]);
-// #else
-//         uint64_t srcData = datas[src].load(std::memory_order_relaxed);
-// #endif
-//         uint32_t fScore = srcData & BOTTOM32_MASK;
-//         uint32_t gScore = (poppedBkt == UNDER_BKT)
-//             ? (fScore + dist(&graph[src], &graph[targetNode]))
-//             : (poppedBkt << delta);
-//         ++iter;
+    auto begin = std::chrono::high_resolution_clock::now();
+    std::vector<std::thread*> workers;
+    cpu_set_t cpuset;
+    for (int i = 1; i < threadNum; i++) {
+        CPU_ZERO(&cpuset);
+        uint32_t coreID = i;
+        CPU_SET(coreID, &cpuset);
+        // if (opt == 0) {
+        //     std::thread *newThread = new std::thread(
+        //         MQBucketThreadTask<true, MQ_Bucket>, std::ref(graph), 
+        //         std::ref(wl), &stats[i], std::ref(datas),
+        //         sourceNode, targetNode, delta,
+        //         batchSizePop, batchSizePush
+        //     );
+        //     int rc = pthread_setaffinity_np(newThread->native_handle(),
+        //                                     sizeof(cpu_set_t), &cpuset);
+        //     if (rc != 0) {
+        //         std::cerr << "Error calling pthread_setaffinity_np: " << rc << "\n";
+        //     }
+        //     workers.push_back(newThread);
+        // } else if (opt == 1) {
+        //     std::thread *newThread = new std::thread(
+        //         MQBucketThreadTask<false, MQ_Bucket>, std::ref(graph), 
+        //         std::ref(wl), &stats[i], std::ref(datas),
+        //         sourceNode, targetNode, delta,
+        //         batchSizePop, batchSizePush
+        //     );
+        //     int rc = pthread_setaffinity_np(newThread->native_handle(),
+        //                                     sizeof(cpu_set_t), &cpuset);
+        //     if (rc != 0) {
+        //         std::cerr << "Error calling pthread_setaffinity_np: " << rc << "\n";
+        //     }
+        //     workers.push_back(newThread);
+        // } else {
+            // basic
+            std::thread *newThread = new std::thread(
+                MQBucketThreadTaskBase<MQ_Bucket>, std::ref(graph), 
+                std::ref(wl), &stats[i], std::ref(datas),
+                sourceNode, targetNode, delta
+            );
+            int rc = pthread_setaffinity_np(newThread->native_handle(),
+                                            sizeof(cpu_set_t), &cpuset);
+            if (rc != 0) {
+                std::cerr << "Error calling pthread_setaffinity_np: " << rc << "\n";
+            }
+            workers.push_back(newThread);
+        // }
+    }
+    CPU_ZERO(&cpuset);
+    CPU_SET(0, &cpuset);
+    sched_setaffinity(0, sizeof(cpuset), &cpuset);
+    // if (opt == 0) {
+    //     MQBucketThreadTask<true, MQ_Bucket>(graph, wl, &stats[0], datas, sourceNode, targetNode, delta,
+    //                             batchSizePop, batchSizePush);
+    // } else if (opt == 1) {
+    //     MQBucketThreadTask<false, MQ_Bucket>(graph, wl, &stats[0], datas, sourceNode, targetNode, delta,
+    //                             batchSizePop, batchSizePush);
+    // } else {
+        // basic
+        MQBucketThreadTaskBase<MQ_Bucket>(graph, wl, &stats[0], datas, sourceNode, targetNode, delta);
+    // }
+    for (std::thread*& worker : workers) {
+        worker->join();
+        delete worker;
+    }
 
-//         for (uint32_t e = 0; e < graph[src].adj.size(); e++) {
-//             auto& adjNode = graph[src].adj[e];
-//             uint32_t dst = adjNode.n;
-//             uint32_t nFScore = fScore + adjNode.d_cm;
-//             if (targetDist != UINT32_MAX && nFScore > targetDist) continue;              
-//             uint64_t dstData = datas[dst].load(std::memory_order_relaxed);
-//             bool swapped = false;
-//             do {
-//                 uint32_t dstDist = dstData & BOTTOM32_MASK;
-//                 if (dstDist <= nFScore) break;
-//                 uint64_t srcShift = src;
-//                 uint64_t swapVal = (srcShift << 32) | nFScore;
-//                 swapped = datas[dst].compare_exchange_weak(
-//                     dstData, swapVal,
-//                     std::memory_order_acq_rel,
-//                     std::memory_order_acquire);
-//             } while(!swapped);
-//             if (!swapped) continue;
-//             uint32_t nGScore = std::max(gScore, nFScore + dist(&graph[dst], &graph[targetNode]));
-//             wl.pushSingle(nGScore >> delta, dst);
-//         }
-//     }
+    auto end = std::chrono::high_resolution_clock::now();
+    auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(end-begin).count();
+    if (!wl.empty()) {
+        std::cout << "not empty\n";
+    }
 
-//     stats->iter = iter;
-//     stats->emptyWork = emptyWork;
-// }
+    wl.stat();
+    std::cout << "runtime_ms " << ms << "\n";
 
-// void astarMQBucket(Vertex* graph, uint32_t numNodes, 
-//                 uint32_t sourceNode, uint32_t targetNode, 
-//                 uint32_t threadNum, uint32_t queueNum, uint32_t bucketNum,
-//                 uint32_t batchSizePop, uint32_t batchSizePush,
-//                 uint32_t opt, uint32_t delta)
-// {
-//     // union of 2x32bit
-//     // | 63..32 | 31..0  |
-//     // | parent | fscore |
-//     std::atomic<uint64_t> *datas = new std::atomic<uint64_t>[numNodes];
-//     for (uint i = 0; i < numNodes; i++) {
-//         datas[i].store(UINT64_MAX, std::memory_order_relaxed);
-//     }
-//     datas[sourceNode] = BOTTOM32_MASK << 32; // source has no parent
-
-//     std::function<bucket_id(uint32_t)> getBucketID = [&] (uint32_t v) -> bucket_id {
-//         uint64_t d = datas[v].load(std::memory_order_acquire);
-//         uint32_t fScore = d & BOTTOM32_MASK;
-//         uint32_t gScore = fScore + dist(&graph[v], &graph[targetNode]);
-//         return bucket_id(gScore) >> delta;
-//     };
-//     using MQ_Bucket = BucketMultiQueueIO<decltype(getBucketID), std::greater<bucket_id>, uint32_t, uint32_t>;
-//     MQ_Bucket wl(getBucketID, queueNum, threadNum, delta, bucketNum, batchSizePop, increasing);
-//     wl.push(0, sourceNode);
-
-//     stat stats[threadNum];
-
-//     auto begin = std::chrono::high_resolution_clock::now();
-//     std::vector<std::thread*> workers;
-//     cpu_set_t cpuset;
-//     for (int i = 1; i < threadNum; i++) {
-//         CPU_ZERO(&cpuset);
-//         uint32_t coreID = i;
-//         CPU_SET(coreID, &cpuset);
-//         if (opt == 0) {
-//             std::thread *newThread = new std::thread(
-//                 MQBucketThreadTask<true, MQ_Bucket>, std::ref(graph), 
-//                 std::ref(wl), &stats[i], std::ref(datas),
-//                 sourceNode, targetNode, delta,
-//                 batchSizePop, batchSizePush
-//             );
-//             int rc = pthread_setaffinity_np(newThread->native_handle(),
-//                                             sizeof(cpu_set_t), &cpuset);
-//             if (rc != 0) {
-//                 std::cerr << "Error calling pthread_setaffinity_np: " << rc << "\n";
-//             }
-//             workers.push_back(newThread);
-//         } else if (opt == 1) {
-//             std::thread *newThread = new std::thread(
-//                 MQBucketThreadTask<false, MQ_Bucket>, std::ref(graph), 
-//                 std::ref(wl), &stats[i], std::ref(datas),
-//                 sourceNode, targetNode, delta,
-//                 batchSizePop, batchSizePush
-//             );
-//             int rc = pthread_setaffinity_np(newThread->native_handle(),
-//                                             sizeof(cpu_set_t), &cpuset);
-//             if (rc != 0) {
-//                 std::cerr << "Error calling pthread_setaffinity_np: " << rc << "\n";
-//             }
-//             workers.push_back(newThread);
-//         } else {
-//             // basic
-//             std::thread *newThread = new std::thread(
-//                 MQBucketThreadTaskBase<MQ_Bucket>, std::ref(graph), 
-//                 std::ref(wl), &stats[i], std::ref(datas),
-//                 sourceNode, targetNode, delta
-//             );
-//             int rc = pthread_setaffinity_np(newThread->native_handle(),
-//                                             sizeof(cpu_set_t), &cpuset);
-//             if (rc != 0) {
-//                 std::cerr << "Error calling pthread_setaffinity_np: " << rc << "\n";
-//             }
-//             workers.push_back(newThread);
-//         }
-//     }
-//     CPU_ZERO(&cpuset);
-//     CPU_SET(0, &cpuset);
-//     sched_setaffinity(0, sizeof(cpuset), &cpuset);
-//     if (opt == 0) {
-//         MQBucketThreadTask<true, MQ_Bucket>(graph, wl, &stats[0], datas, sourceNode, targetNode, delta,
-//                                 batchSizePop, batchSizePush);
-//     } else if (opt == 1) {
-//         MQBucketThreadTask<false, MQ_Bucket>(graph, wl, &stats[0], datas, sourceNode, targetNode, delta,
-//                                 batchSizePop, batchSizePush);
-//     } else {
-//         // basic
-//         MQBucketThreadTaskBase<MQ_Bucket>(graph, wl, &stats[0], datas, sourceNode, targetNode, delta);
-//     }
-//     for (std::thread*& worker : workers) {
-//         worker->join();
-//         delete worker;
-//     }
-
-//     auto end = std::chrono::high_resolution_clock::now();
-//     auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(end-begin).count();
-//     if (!wl.empty()) {
-//         std::cout << "not empty\n";
-//     }
-
-//     wl.stat();
-//     std::cout << "runtime_ms " << ms << "\n";
-
-//     // trace back the path for verification
-//     uint32_t cur = targetNode;
-//     while (cur != sourceNode) {
-//         uint32_t parent = datas[cur].load(std::memory_order_relaxed) >> 32;
-//         graph[cur].prev = parent;
-//         cur = parent;
-//     }
-// }
+    // trace back the path for verification
+    uint32_t cur = targetNode;
+    while (cur != sourceNode) {
+        uint32_t parent = datas[cur].load(std::memory_order_relaxed) >> 32;
+        graph[cur].prev = parent;
+        cur = parent;
+    }
+}
 
 void astarSerial(Vertex* graph, uint32_t numNodes, 
                 uint32_t sourceNode, uint32_t targetNode)
@@ -902,9 +783,9 @@ int main(int argc, const char** argv) {
     } else if (algoType == "MQIOPlain") {
         astarMQIOPlain(graph, numNodes, sourceNode, targetNode, threadNum, queueNum);
     } else if (algoType == "MQBucket") {
-        // astarMQBucket(graph, numNodes, sourceNode, targetNode, 
-        //     threadNum, queueNum, bucketNum, 
-        //     batchSizePop, batchSizePush, opt, delta);
+        astarMQBucket(graph, numNodes, sourceNode, targetNode, 
+            threadNum, queueNum, bucketNum, 
+            batchSizePop, batchSizePush, opt, delta);
     } else if (algoType == "Serial") {
         astarSerial(graph, numNodes, sourceNode, targetNode);
     } else {
