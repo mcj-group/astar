@@ -25,6 +25,12 @@
  *    but it's pretty doable)
  */
 
+/* The parallel versions use 64 bit data to allow for single CAS of a 64 bit data.
+ * It is a union of 2 x 32 bit that encapsulates parent and distance.
+ *  | 63..32 | 31..0  |
+ *  | parent | fscore |
+ */
+
 constexpr static uint64_t FSCORE_MASK = 0xffffffff;
 constexpr static bucket_id UNDER_BKT = INT64_MAX - 1;
 
@@ -52,9 +58,19 @@ void MQIOThreadTask(const Vertex* graph, MQ_IO &wl, stat *stats,
 
         uint64_t targetData = datas[targetNode].load(std::memory_order_relaxed);
         uint32_t targetDist = targetData & FSCORE_MASK;
+        ++iter;
+
+        // With the astar definition, our heuristic
+        // will always overestimate. If the current task's
+        // gScore is already greater than the targetDist,
+        // then it won't ever lead to a shorter path to target.
+        if (targetDist <= gScore) {
+            ++emptyWork;
+            continue;
+        }
+
         uint64_t srcData = datas[src].load(std::memory_order_relaxed);
         uint32_t fScore = srcData & FSCORE_MASK;
-        ++iter;
 
         for (uint32_t e = 0; e < graph[src].adj.size(); e++) {
             auto& adjNode = graph[src].adj[e];
@@ -75,6 +91,7 @@ void MQIOThreadTask(const Vertex* graph, MQ_IO &wl, stat *stats,
             } while(!swapped);
             if (!swapped) continue;
             uint32_t nGScore = std::max(gScore, nFScore + dist(&graph[dst], &graph[targetNode]));
+            if (targetDist <= nGScore) continue;
             wl.push({nGScore, dst});
         }
     }
@@ -88,9 +105,6 @@ void astarMQIO(Vertex* graph, uint32_t numNodes,
                 uint32_t threadNum, uint32_t queueNum)
 {
     MQ_IO wl(queueNum, threadNum, 1);
-    // union of 2x32bit
-    // | 63..32 | 31..0  |
-    // | parent | fscore |
     std::atomic<uint64_t> *datas = new std::atomic<uint64_t>[numNodes];
     for (uint i = 0; i < numNodes; i++) {
         datas[i].store(UINT64_MAX, std::memory_order_relaxed);
@@ -163,12 +177,20 @@ void MQBucketThreadTask(const Vertex* graph, MQ_Bucket &wl, stat *stats,
 
         uint64_t targetData = datas[targetNode].load(std::memory_order_relaxed);
         uint32_t targetDist = targetData & FSCORE_MASK;
-        uint32_t idx = 0;
-        uint64_t srcData = datas[src].load(std::memory_order_relaxed);
-        uint32_t fScore = srcData & FSCORE_MASK;
         uint32_t gScore = poppedBkt << delta;
         ++iter;
 
+        // With the astar definition, our heuristic
+        // will always overestimate. If the current task's
+        // gScore is already greater than the targetDist,
+        // then it won't ever lead to a shorter path to target.
+        if (targetDist <= gScore) {
+            ++emptyWork;
+            continue;
+        }
+
+        uint64_t srcData = datas[src].load(std::memory_order_relaxed);
+        uint32_t fScore = srcData & FSCORE_MASK;
         for (uint32_t e = 0; e < graph[src].adj.size(); e++) {
             auto& adjNode = graph[src].adj[e];
             uint32_t dst = adjNode.n;
@@ -188,6 +210,7 @@ void MQBucketThreadTask(const Vertex* graph, MQ_Bucket &wl, stat *stats,
             } while(!swapped);
             if (!swapped) continue;
             uint32_t nGScore = std::max(gScore, nFScore + dist(&graph[dst], &graph[targetNode]));
+            if (targetDist <= nGScore) continue;
             wl.pushSingle(nGScore >> delta, dst);
         }
     }
@@ -201,9 +224,6 @@ void astarMQBucket(Vertex* graph, uint32_t numNodes,
                 uint32_t threadNum, uint32_t queueNum, uint32_t bucketNum,
                 uint32_t delta)
 {
-    // union of 2x32bit
-    // | 63..32 | 31..0  |
-    // | parent | fscore |
     std::atomic<uint64_t> *datas = new std::atomic<uint64_t>[numNodes];
     for (uint i = 0; i < numNodes; i++) {
         datas[i].store(UINT64_MAX, std::memory_order_relaxed);
@@ -288,6 +308,7 @@ void astarSerial(Vertex* graph, uint32_t numNodes,
     uint32_t gScore;
     uint32_t src;
     uint32_t iter = 0;
+    uint32_t emptyWork = 0;
     uint32_t maxSize = 0;
     while (!wl.empty()) {
         if (wl.size() > maxSize) maxSize = wl.size();
@@ -298,14 +319,24 @@ void astarSerial(Vertex* graph, uint32_t numNodes,
         uint32_t fScore = prios[src];
         ++iter;
 
+        // With the astar definition, our heuristic
+        // will always overestimate. If the current task's
+        // gScore is already greater than the targetDist,
+        // then it won't ever lead to a shorter path to target.
+        if (targetDist <= gScore) {
+            ++emptyWork;
+            continue;
+        }
+
         for (uint32_t e = 0; e < graph[src].adj.size(); e++) {
             auto& adjNode = graph[src].adj[e];
             uint32_t dst = adjNode.n;
             uint32_t nFScore = fScore + adjNode.d_cm;
-            if (targetDist != UINT32_MAX && nFScore > targetDist) continue;              
+            if (nFScore > targetDist) continue;
             uint32_t d = prios[dst];
             if (d <= nFScore) continue;
             uint32_t nGScore = std::max(gScore, nFScore + dist(&graph[dst], &graph[targetNode]));
+            if (targetDist <= nGScore) continue;
             prios[dst] = nFScore;
             graph[dst].prev = src;
             wl.push({nGScore, dst});
@@ -317,6 +348,7 @@ void astarSerial(Vertex* graph, uint32_t numNodes,
     auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(end-begin).count();
     std::cout << "runtime_ms " << ms << "\n";
     std::cout << "iter " << iter << "\n";
+    std::cout << "empty work " << emptyWork << "\n";
     std::cout << "max size " << maxSize << "\n";
 }
 

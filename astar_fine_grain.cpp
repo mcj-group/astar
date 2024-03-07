@@ -25,6 +25,12 @@
  *    but it's pretty doable)
  */
 
+/* The parallel versions use 64 bit data to allow for single CAS of a 64 bit data.
+ * It is a union of 2 x 32 bit that encapsulates parent and distance.
+ *  | 63..32 | 31..0  |
+ *  | parent | fscore |
+ */
+
 /* This is a fine-grain version of astar:
  *  - It enqueues 2 tasks: one for visiting neighbors, the other for computing the floating point
  *  - The tasks are enqueued with the same priority and same key, but the key's top bit
@@ -59,20 +65,35 @@ void MQIOThreadTask(const Vertex* graph, MQ_IO &wl, stat *stats,
         if (item) std::tie(gScore, task) = item.get();
         else break;
 
+        uint64_t targetData = datas[targetNode].load(std::memory_order_relaxed);
+        uint32_t targetDist = targetData & BOTTOM32_MASK;
+
+        // With the astar definition, our heuristic
+        // will always overestimate. If the current task's
+        // gScore is already greater than the targetDist,
+        // then it won't ever lead to a shorter path to target.
+        if (targetDist <= gScore) {
+            ++emptyWork;
+            continue;
+        }
+
         uint32_t vertex = task >> 32;
         uint32_t data = task & BOTTOM32_MASK;
-
+        
         if (data & COMPUTE_TASK_BIT) {
+            // perform floating point computation and enqueue the neighbor
             ++iterCompute;
             uint32_t nFScore = data & VERTEX_ID_MASK;
             uint32_t nGScore = std::max(gScore, nFScore + dist(&graph[vertex], &graph[targetNode]));
+            if (targetDist <= nGScore) continue;
             uint64_t n = vertex;
             wl.push({nGScore, n << 32});
 
         } else {
+            // visit each neighbor and enqueue with the actual distance
+            // to each neighbor, leave the floating point heuristic 
+            // computation to the compute task
             ++iterVisit;
-            uint64_t targetData = datas[targetNode].load(std::memory_order_relaxed);
-            uint32_t targetDist = targetData & BOTTOM32_MASK;
             uint64_t srcData = datas[vertex].load(std::memory_order_relaxed);
             uint32_t fScore = srcData & BOTTOM32_MASK;
 
@@ -110,9 +131,7 @@ void astarMQIO(Vertex* graph, uint32_t numNodes,
                 uint32_t threadNum, uint32_t queueNum)
 {
     MQ_IO wl(queueNum, threadNum, 1);
-    // union of 2x32bit
-    // | 63..32 | 31..0  |
-    // | parent | fscore |
+
     std::atomic<uint64_t> *datas = new std::atomic<uint64_t>[numNodes];
     for (uint i = 0; i < numNodes; i++) {
         datas[i].store(UINT64_MAX, std::memory_order_relaxed);
@@ -184,22 +203,37 @@ void MQBucketThreadTask(const Vertex* graph, MQ_Bucket &wl, stat *stats,
         auto item = wl.tryPopSingle();
         if (item) std::tie(task, poppedBkt) = item.get();
         else break;
+        
+        uint64_t targetData = datas[targetNode].load(std::memory_order_relaxed);
+        uint32_t targetDist = targetData & BOTTOM32_MASK;
+        uint32_t gScore = poppedBkt << delta;
+
+        // With the astar definition, our heuristic
+        // will always overestimate. If the current task's
+        // gScore is already greater than the targetDist,
+        // then it won't ever lead to a shorter path to target.
+        if (targetDist <= gScore) {
+            ++emptyWork;
+            continue;
+        }
 
         uint32_t vertex = task >> 32;
         uint32_t data = task & BOTTOM32_MASK;
 
         if (data & COMPUTE_TASK_BIT) {
+            // perform floating point computation and enqueue the neighbor
             ++iterCompute;
             uint32_t nFScore = data & VERTEX_ID_MASK;
-            uint32_t gScore = poppedBkt << delta;
             uint32_t nGScore = std::max(gScore, nFScore + dist(&graph[vertex], &graph[targetNode]));
+            if (targetDist <= nGScore) continue;
             uint64_t n = vertex;
             wl.pushSingle(nGScore >> delta, n << 32);
 
         } else {
+            // visit each neighbor and enqueue with the actual distance
+            // to each neighbor, leave the floating point heuristic 
+            // computation to the compute task
             ++iterVisit;
-            uint64_t targetData = datas[targetNode].load(std::memory_order_relaxed);
-            uint32_t targetDist = targetData & BOTTOM32_MASK;
             uint64_t srcData = datas[vertex].load(std::memory_order_relaxed);
             uint32_t fScore = srcData & BOTTOM32_MASK;
 
@@ -238,9 +272,6 @@ void astarMQBucket(Vertex* graph, uint32_t numNodes,
                 uint32_t threadNum, uint32_t queueNum, uint32_t bucketNum,
                 uint32_t delta)
 {
-    // union of 2x32bit
-    // | 63..32 | 31..0  |
-    // | parent | fscore |
     std::atomic<uint64_t> *datas = new std::atomic<uint64_t>[numNodes];
     for (uint i = 0; i < numNodes; i++) {
         datas[i].store(UINT64_MAX, std::memory_order_relaxed);
@@ -327,6 +358,7 @@ void astarSerial(Vertex* graph, uint32_t numNodes,
 
     uint32_t gScore;
     uint64_t task;
+    uint32_t emptyWork = 0;
     uint32_t iterVisit = 0;
     uint32_t iterCompute = 0;
     uint32_t maxSize = 0;
@@ -334,19 +366,35 @@ void astarSerial(Vertex* graph, uint32_t numNodes,
         if (wl.size() > maxSize) maxSize = wl.size();
         std::tie(gScore, task) = wl.top();
         wl.pop();
+
+        uint32_t targetDist = prios[targetNode];
+
+        // With the astar definition, our heuristic
+        // will always overestimate. If the current task's
+        // gScore is already greater than the targetDist,
+        // then it won't ever lead to a shorter path to target.
+        if (targetDist <= gScore) {
+            ++emptyWork;
+            continue;
+        }
+
         uint32_t vertex = task >> 32;
         uint32_t data = task & BOTTOM32_MASK;
 
         if (data & COMPUTE_TASK_BIT) {
+            // perform floating point computation and enqueue the neighbor
             ++iterCompute;
             uint32_t nFScore = data & VERTEX_ID_MASK;
             uint32_t nGScore = std::max(gScore, nFScore + dist(&graph[vertex], &graph[targetNode]));
+            if (targetDist <= nGScore) continue;
             uint64_t n = vertex;
             wl.push({nGScore, n << 32});
 
         } else {
+            // visit each neighbor and enqueue with the actual distance
+            // to each neighbor, leave the floating point heuristic 
+            // computation to the compute task
             ++iterVisit;
-            uint32_t targetDist = prios[targetNode];
             uint32_t fScore = prios[vertex];
             for (uint32_t e = 0; e < graph[vertex].adj.size(); e++) {
                 auto& adjNode = graph[vertex].adj[e];
@@ -369,6 +417,7 @@ void astarSerial(Vertex* graph, uint32_t numNodes,
     std::cout << "runtime_ms " << ms << "\n";
     std::cout << "iter visit " << iterVisit << "\n";
     std::cout << "iter compute " << iterCompute << "\n";
+    std::cout << "empty work " << emptyWork << "\n";
     std::cout << "max size " << maxSize << "\n";
 }
 
