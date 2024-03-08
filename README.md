@@ -14,19 +14,44 @@ cmake .. -DCMAKE_BUILD_TYPE=Release
 make astar -j
 make astar_fine_grain -j
 
-# in the build folder, run astar like so
-./astar <input file> <startNode> <targetNode> <type> <numThreads> <numQueues> <numBuckets> <delta> <printFull>
+# in the build folder, run astar like so,
+# arguments must follow this order
+./astar <inFile> [startNode endNode qType threadNum bucketNum printFull]
 
-# run astar and astar_fine_grain
-./astar croatia.bin 0 320970 Serial 1 4 64 0 0
-./astar_fine_grain croatia.bin 0 320970 Serial 1 4 64 0 0
+# run astar and astar_fine_grain with default arguments on croatia
+./astar croatia.bin 
+./astar_fine_grain croatia.bin
+
+# run astar serial
+./astar croatia.bin 0 320970 Serial
+
+# run astar with MultiQueue and 16 threads
+./astar croatia.bin 0 320970 MQIO 16
+
+# run astar with BucketMQ, 16 threads, 128 buckets, and delta of 10
+./astar croatia.bin 0 320970 MQBucket 16 128 10 
 ```
 
 # Verification
 `astar` and `astar_fine_grain` both output a `path.txt` that prints the path from `startNode` to `targetNode`.
 
 To verify the output of a `{map, startNode, targetNode}` configuration:
-  1. run the configuration with `Serial` type, this outputs a correct path.txt with the final distances of the path
-  2. change the outputted `path.txt` to `mapName.txt`
-  3. run the configuration with the desired type
-  4. run the command `diff path.txt mapName.txt` to check if the path and distance differs
+```
+# 1. run the configuration with `Serial` type
+#    this outputs a correct path.txt with the final distances of the path
+./astar <map> <startNode> <targetNode> Serial
+
+# 2. save the outputted path file with a different name
+mv path.txt mapName.txt
+
+# 3. run the configuration with the desired type and threads, etc
+./astar <map> <startNode> <targetNode> <desiredType> <threadNum>
+
+# 4. compare the path and distances
+diff path.txt mapName.txt
+
+```
+  
+  
+  
+  
