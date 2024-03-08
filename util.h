@@ -2,6 +2,7 @@
 #define ASTAR_UTIL
 
 const double EarthRadius_cm = 637100000.0;
+const uint32_t QUEUES_PER_THREAD = 4;
 
 struct Vertex;
 

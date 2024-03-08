@@ -423,7 +423,7 @@ void astarSerial(Vertex* graph, uint32_t numNodes,
 
 int main(int argc, const char** argv) {
     if (argc < 2) {
-        printf("Usage: %s <inFile> [startNode endNode] [qType] [thread queue bucketNum]\n", argv[0]);
+        printf("Usage: %s <inFile> <startNode> <endNode> [qType threadNum bucketNum printFull]\n", argv[0]);
         printf("Types: Serial / MQIO / MQBucket\n");
         return -1;
     }
@@ -432,14 +432,14 @@ int main(int argc, const char** argv) {
     uint32_t numNodes;
     std::tie(graph, numNodes) = LoadGraph(argv[1]);
 
-    uint32_t sourceNode = (argc > 2)? std::min((uint32_t)atoi(argv[2]), numNodes-1) : 1*numNodes/10;
-    uint32_t targetNode = (argc > 3)? std::min((uint32_t)atoi(argv[3]), numNodes-1) : 9*numNodes/10;
-    std::string algoType(argv[4]);
-    uint32_t threadNum = atol(argv[5]);
-    uint32_t queueNum = atol(argv[6]);
-    uint32_t bucketNum = atol(argv[7]);
-    uint32_t delta = atol(argv[8]);
-    uint32_t printFull = atol(argv[9]);
+    uint32_t sourceNode = (argc > 2) ? std::min((uint32_t)atoi(argv[2]), numNodes-1) : 1*numNodes/10;
+    uint32_t targetNode = (argc > 3) ? std::min((uint32_t)atoi(argv[3]), numNodes-1) : 9*numNodes/10;
+    std::string algoType = (argc > 4) ? argv[4] : "Serial";
+    uint32_t threadNum = (argc > 5) ? atol(argv[5]) : 1;
+    uint32_t bucketNum = (argc > 6) ? atol(argv[6]) : 64;
+    uint32_t delta = (argc > 7) ? atol(argv[7]) : 0;
+    uint32_t printFull = (argc > 8) ? atol(argv[8]) : 0;
+    uint32_t queueNum = threadNum * QUEUES_PER_THREAD;
     printf("Finding shortest path between nodes %d and %d\n", sourceNode, targetNode);
     printf("Type: %s\n", algoType.c_str());
     printf("Threads: %d\n", threadNum);
