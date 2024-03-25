@@ -35,13 +35,13 @@ constexpr static uint64_t FSCORE_MASK = 0xffffffff;
 constexpr static bucket_id UNDER_BKT = INT64_MAX - 1;
 
 using PQElement = std::tuple<uint32_t, uint32_t>;
-using BktElement = std::tuple<bucket_id, uint32_t>;
-using MQ_IO = MultiQueueIO<std::greater<PQElement>, uint32_t, uint32_t>;
+using BktElement = std::tuple<bucket_id, uint64_t>;
 struct stat {
   uint32_t iter = 0;
   uint32_t emptyWork = 0;
 };
 
+template<typename MQ_IO>
 void MQIOThreadTask(const Vertex* graph, MQ_IO &wl, stat *stats,
                     std::atomic<uint64_t> *datas, 
                     uint32_t sourceNode, uint32_t targetNode)
@@ -50,9 +50,10 @@ void MQIOThreadTask(const Vertex* graph, MQ_IO &wl, stat *stats,
     uint32_t emptyWork = 0UL;
     uint32_t gScore;
     uint32_t src;
+    wl.initTID();
 
     while (true) {
-        auto item = wl.tryPop();
+        auto item = wl.pop();
         if (item) std::tie(gScore, src) = item.get();
         else break;
 
@@ -76,7 +77,7 @@ void MQIOThreadTask(const Vertex* graph, MQ_IO &wl, stat *stats,
             auto& adjNode = graph[src].adj[e];
             uint32_t dst = adjNode.n;
             uint32_t nFScore = fScore + adjNode.d_cm;
-            if (targetDist != UINT32_MAX && nFScore > targetDist) continue;              
+            if (targetDist <= nFScore) continue;              
             uint64_t dstData = datas[dst].load(std::memory_order_relaxed);
             bool swapped = false;
             do {
@@ -92,7 +93,7 @@ void MQIOThreadTask(const Vertex* graph, MQ_IO &wl, stat *stats,
             if (!swapped) continue;
             uint32_t nGScore = std::max(gScore, nFScore + dist(&graph[dst], &graph[targetNode]));
             if (targetDist <= nGScore) continue;
-            wl.push({nGScore, dst});
+            wl.push(nGScore, dst);
         }
     }
 
@@ -104,13 +105,19 @@ void astarMQIO(Vertex* graph, uint32_t numNodes,
                 uint32_t sourceNode, uint32_t targetNode, 
                 uint32_t threadNum, uint32_t queueNum)
 {
-    MQ_IO wl(queueNum, threadNum, 1);
     std::atomic<uint64_t> *datas = new std::atomic<uint64_t>[numNodes];
     for (uint i = 0; i < numNodes; i++) {
         datas[i].store(UINT64_MAX, std::memory_order_relaxed);
     }
+    std::function<void(uint32_t)> prefetcher = [&] (uint32_t v) -> void {
+        __builtin_prefetch(&datas[v], 0, 3);
+    };
+    using MQ_IO = MultiQueueIO<decltype(prefetcher), std::greater<PQElement>, uint32_t, uint32_t>;
+    // Note: we set batch to 1 for now as astar don't seem to benefit from batching
+    MQ_IO wl(prefetcher, queueNum, threadNum, 1, 1);
+
     datas[sourceNode] = FSCORE_MASK << 32; // source has no parent
-    wl.push(std::make_tuple(0, sourceNode));
+    wl.push(0, sourceNode);
 
     stat stats[threadNum];
 
@@ -122,7 +129,7 @@ void astarMQIO(Vertex* graph, uint32_t numNodes,
         uint32_t coreID = i;
         CPU_SET(coreID, &cpuset);
         std::thread *newThread = new std::thread(
-            MQIOThreadTask, std::ref(graph), 
+            MQIOThreadTask<MQ_IO>, std::ref(graph), 
             std::ref(wl), &stats[i], std::ref(datas),
             sourceNode, targetNode
         );
@@ -136,7 +143,7 @@ void astarMQIO(Vertex* graph, uint32_t numNodes,
     CPU_ZERO(&cpuset);
     CPU_SET(0, &cpuset);
     sched_setaffinity(0, sizeof(cpuset), &cpuset);
-    MQIOThreadTask(graph, wl, &stats[0], datas, sourceNode, targetNode);
+    MQIOThreadTask<MQ_IO>(graph, wl, &stats[0], datas, sourceNode, targetNode);
     for (std::thread*& worker : workers) {
         worker->join();
         delete worker;
@@ -168,11 +175,11 @@ void MQBucketThreadTask(const Vertex* graph, MQ_Bucket &wl, stat *stats,
     uint32_t emptyWork = 0UL;
     uint32_t src;
     bucket_id poppedBkt;
+    wl.initTID();
 
     while (true) {
-        uint32_t prefetchIdx;
-        auto item = wl.tryPopSingle();
-        if (item) std::tie(src, poppedBkt) = item.get();
+        auto item = wl.pop();
+        if (item) std::tie(poppedBkt, src) = item.get();
         else break;
 
         uint64_t targetData = datas[targetNode].load(std::memory_order_relaxed);
@@ -195,7 +202,7 @@ void MQBucketThreadTask(const Vertex* graph, MQ_Bucket &wl, stat *stats,
             auto& adjNode = graph[src].adj[e];
             uint32_t dst = adjNode.n;
             uint32_t nFScore = fScore + adjNode.d_cm;
-            if (targetDist != UINT32_MAX && nFScore > targetDist) continue;              
+            if (targetDist <= nFScore) continue;              
             uint64_t dstData = datas[dst].load(std::memory_order_relaxed);
             bool swapped = false;
             do {
@@ -211,7 +218,7 @@ void MQBucketThreadTask(const Vertex* graph, MQ_Bucket &wl, stat *stats,
             if (!swapped) continue;
             uint32_t nGScore = std::max(gScore, nFScore + dist(&graph[dst], &graph[targetNode]));
             if (targetDist <= nGScore) continue;
-            wl.pushSingle(nGScore >> delta, dst);
+            wl.push(nGScore, dst);
         }
     }
 
@@ -236,8 +243,12 @@ void astarMQBucket(Vertex* graph, uint32_t numNodes,
         uint32_t gScore = fScore + dist(&graph[v], &graph[targetNode]);
         return bucket_id(gScore) >> delta;
     };
-    using MQ_Bucket = BucketMultiQueueIO<decltype(getBucketID), std::greater<bucket_id>, uint32_t, uint32_t>;
-    MQ_Bucket wl(getBucketID, queueNum, threadNum, delta, bucketNum, 1, increasing);
+    std::function<void(uint32_t)> prefetcher = [&] (uint32_t v) -> void {
+        __builtin_prefetch(&datas[v], 0, 3);
+    };
+    using MQ_Bucket = BucketMultiQueueIO<decltype(getBucketID), decltype(prefetcher), std::greater<bucket_id>, uint32_t, uint32_t>;
+    // Note: we set batch to 1 for now as astar don't seem to benefit from batching
+    MQ_Bucket wl(getBucketID, prefetcher, queueNum, threadNum, delta, bucketNum, 1, 1, increasing);
     wl.push(0, sourceNode);
 
     stat stats[threadNum];
@@ -332,7 +343,7 @@ void astarSerial(Vertex* graph, uint32_t numNodes,
             auto& adjNode = graph[src].adj[e];
             uint32_t dst = adjNode.n;
             uint32_t nFScore = fScore + adjNode.d_cm;
-            if (nFScore > targetDist) continue;
+            if (targetDist <= nFScore) continue;
             uint32_t d = prios[dst];
             if (d <= nFScore) continue;
             uint32_t nGScore = std::max(gScore, nFScore + dist(&graph[dst], &graph[targetNode]));

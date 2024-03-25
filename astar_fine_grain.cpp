@@ -43,13 +43,13 @@ constexpr static uint64_t VERTEX_ID_MASK = ~COMPUTE_TASK_BIT;
 
 using PQElement = std::tuple<uint32_t, uint64_t>;
 using BktElement = std::tuple<bucket_id, uint64_t>;
-using MQ_IO = MultiQueueIO<std::greater<PQElement>, uint32_t, uint64_t>;
 struct stat {
   uint32_t iterVisit = 0;
   uint32_t iterCompute = 0;
   uint32_t emptyWork = 0;
 };
 
+template<typename MQ_IO>
 void MQIOThreadTask(const Vertex* graph, MQ_IO &wl, stat *stats,
                         std::atomic<uint64_t> *datas, 
                         uint32_t sourceNode, uint32_t targetNode)
@@ -59,9 +59,10 @@ void MQIOThreadTask(const Vertex* graph, MQ_IO &wl, stat *stats,
     uint32_t emptyWork = 0UL;
     uint64_t task;
     uint32_t gScore;
+    wl.initTID();
 
     while (true) {
-        auto item = wl.tryPop();
+        auto item = wl.pop();
         if (item) std::tie(gScore, task) = item.get();
         else break;
 
@@ -87,7 +88,7 @@ void MQIOThreadTask(const Vertex* graph, MQ_IO &wl, stat *stats,
             uint32_t nGScore = std::max(gScore, nFScore + dist(&graph[vertex], &graph[targetNode]));
             if (targetDist <= nGScore) continue;
             uint64_t n = vertex;
-            wl.push({nGScore, n << 32});
+            wl.push(nGScore, n << 32);
 
         } else {
             // visit each neighbor and enqueue with the actual distance
@@ -116,7 +117,7 @@ void MQIOThreadTask(const Vertex* graph, MQ_IO &wl, stat *stats,
                 } while(!swapped);
                 if (!swapped) continue;
                 uint64_t n = dst;
-                wl.push({gScore, (n << 32 | nFScore | COMPUTE_TASK_BIT)});
+                wl.push(gScore, (n << 32 | nFScore | COMPUTE_TASK_BIT));
             }
         }
     }
@@ -130,15 +131,20 @@ void astarMQIO(Vertex* graph, uint32_t numNodes,
                 uint32_t sourceNode, uint32_t targetNode, 
                 uint32_t threadNum, uint32_t queueNum)
 {
-    MQ_IO wl(queueNum, threadNum, 1);
 
     std::atomic<uint64_t> *datas = new std::atomic<uint64_t>[numNodes];
     for (uint i = 0; i < numNodes; i++) {
         datas[i].store(UINT64_MAX, std::memory_order_relaxed);
     }
     datas[sourceNode] = BOTTOM32_MASK << 32; // source has no parent
+    std::function<void(uint32_t)> prefetcher = [&] (uint32_t v) -> void {
+        __builtin_prefetch(&datas[v], 0, 3);
+    };
+    using MQ_IO = MultiQueueIO<decltype(prefetcher), std::greater<PQElement>, uint32_t, uint64_t>;
+    // Note: we set batch to 1 for now as astar don't seem to benefit from batching
+    MQ_IO wl(prefetcher, queueNum, threadNum, 1, 1);
     uint64_t node = sourceNode;
-    wl.push(std::make_tuple(dist(&graph[sourceNode], &graph[targetNode]), node << 32));
+    wl.push(dist(&graph[sourceNode], &graph[targetNode]), node << 32);
 
     stat stats[threadNum];
 
@@ -150,7 +156,7 @@ void astarMQIO(Vertex* graph, uint32_t numNodes,
         uint32_t coreID = i;
         CPU_SET(coreID, &cpuset);
         std::thread *newThread = new std::thread(
-            MQIOThreadTask, std::ref(graph), 
+            MQIOThreadTask<MQ_IO>, std::ref(graph), 
             std::ref(wl), &stats[i], std::ref(datas),
             sourceNode, targetNode
         );
@@ -164,7 +170,7 @@ void astarMQIO(Vertex* graph, uint32_t numNodes,
     CPU_ZERO(&cpuset);
     CPU_SET(0, &cpuset);
     sched_setaffinity(0, sizeof(cpuset), &cpuset);
-    MQIOThreadTask(graph, wl, &stats[0], datas, sourceNode, targetNode);
+    MQIOThreadTask<MQ_IO>(graph, wl, &stats[0], datas, sourceNode, targetNode);
     for (std::thread*& worker : workers) {
         worker->join();
         delete worker;
@@ -198,10 +204,11 @@ void MQBucketThreadTask(const Vertex* graph, MQ_Bucket &wl, stat *stats,
     uint32_t emptyWork = 0UL;
     uint64_t task;
     bucket_id poppedBkt;
+    wl.initTID();
 
     while (true) {
-        auto item = wl.tryPopSingle();
-        if (item) std::tie(task, poppedBkt) = item.get();
+        auto item = wl.pop();
+        if (item) std::tie(poppedBkt, task) = item.get();
         else break;
         
         uint64_t targetData = datas[targetNode].load(std::memory_order_relaxed);
@@ -227,7 +234,7 @@ void MQBucketThreadTask(const Vertex* graph, MQ_Bucket &wl, stat *stats,
             uint32_t nGScore = std::max(gScore, nFScore + dist(&graph[vertex], &graph[targetNode]));
             if (targetDist <= nGScore) continue;
             uint64_t n = vertex;
-            wl.pushSingle(nGScore >> delta, n << 32);
+            wl.push(nGScore, n << 32);
 
         } else {
             // visit each neighbor and enqueue with the actual distance
@@ -256,7 +263,7 @@ void MQBucketThreadTask(const Vertex* graph, MQ_Bucket &wl, stat *stats,
                 } while(!swapped);
                 if (!swapped) continue;
                 uint64_t n = dst;
-                wl.pushSingle(poppedBkt, (n << 32 | nFScore | COMPUTE_TASK_BIT));
+                wl.push(poppedBkt, (n << 32 | nFScore | COMPUTE_TASK_BIT));
 
             }
         }
@@ -285,8 +292,12 @@ void astarMQBucket(Vertex* graph, uint32_t numNodes,
         uint32_t gScore = fScore + dist(&graph[v], &graph[targetNode]);
         return bucket_id(gScore) >> delta;
     };
-    using MQ_Bucket = BucketMultiQueueIO<decltype(getBucketID), std::greater<bucket_id>, uint32_t, uint64_t>;
-    MQ_Bucket wl(getBucketID, queueNum, threadNum, delta, bucketNum, 1, increasing);
+    std::function<void(uint32_t)> prefetcher = [&] (uint32_t v) -> void {
+        __builtin_prefetch(&datas[v], 0, 3);
+    };
+    using MQ_Bucket = BucketMultiQueueIO<decltype(getBucketID), decltype(prefetcher), std::greater<bucket_id>, uint32_t, uint64_t>;
+    // Note: we set batch to 1 for now as astar don't seem to benefit from batching
+    MQ_Bucket wl(getBucketID, prefetcher, queueNum, threadNum, delta, bucketNum, 1, 1, increasing);
     uint64_t node = sourceNode;
     bucket_id b = bucket_id(dist(&graph[sourceNode], &graph[targetNode])) >> delta;
     wl.push(b, node << 32);
