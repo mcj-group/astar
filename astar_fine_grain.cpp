@@ -102,7 +102,7 @@ void MQIOThreadTask(const Vertex* graph, MQ_IO &wl, stat *stats,
                 auto& adjNode = graph[vertex].adj[e];
                 uint32_t dst = adjNode.n;
                 uint32_t nFScore = fScore + adjNode.d_cm;
-                if (targetDist != UINT32_MAX && nFScore > targetDist) continue;              
+                if (targetDist <= nFScore) continue;              
                 uint64_t dstData = datas[dst].load(std::memory_order_relaxed);
                 bool swapped = false;
                 do {
@@ -127,9 +127,11 @@ void MQIOThreadTask(const Vertex* graph, MQ_IO &wl, stat *stats,
     stats->emptyWork = emptyWork;
 }
 
+template<bool usePlain> 
 void astarMQIO(Vertex* graph, uint32_t numNodes, 
                 uint32_t sourceNode, uint32_t targetNode, 
-                uint32_t threadNum, uint32_t queueNum)
+                uint32_t threadNum, uint32_t queueNum,
+                uint32_t batchSizePop, uint32_t batchSizePush)
 {
 
     std::atomic<uint64_t> *datas = new std::atomic<uint64_t>[numNodes];
@@ -140,9 +142,12 @@ void astarMQIO(Vertex* graph, uint32_t numNodes,
     std::function<void(uint32_t)> prefetcher = [&] (uint32_t v) -> void {
         __builtin_prefetch(&datas[v], 0, 3);
     };
-    using MQ_IO = MultiQueueIO<decltype(prefetcher), std::greater<PQElement>, uint32_t, uint64_t>;
-    // Note: we set batch to 1 for now as astar don't seem to benefit from batching
-    MQ_IO wl(prefetcher, queueNum, threadNum, 1, 1);
+    using MQ_IO = MultiQueueIO<decltype(prefetcher), std::greater<PQElement>, uint32_t, uint64_t, usePlain>;
+    if (usePlain) {
+        batchSizePop = 1;
+        batchSizePush = 1;
+    }
+    MQ_IO wl(prefetcher, queueNum, threadNum, batchSizePop, batchSizePush);
     uint64_t node = sourceNode;
     wl.push(dist(&graph[sourceNode], &graph[targetNode]), node << 32);
 
@@ -248,7 +253,7 @@ void MQBucketThreadTask(const Vertex* graph, MQ_Bucket &wl, stat *stats,
                 auto& adjNode = graph[vertex].adj[e];
                 uint32_t dst = adjNode.n;
                 uint32_t nFScore = fScore + adjNode.d_cm;
-                if (targetDist != UINT32_MAX && nFScore > targetDist) continue;              
+                if (targetDist <= nFScore) continue;              
                 uint64_t dstData = datas[dst].load(std::memory_order_relaxed);
                 bool swapped = false;
                 do {
@@ -277,7 +282,7 @@ void MQBucketThreadTask(const Vertex* graph, MQ_Bucket &wl, stat *stats,
 void astarMQBucket(Vertex* graph, uint32_t numNodes, 
                 uint32_t sourceNode, uint32_t targetNode, 
                 uint32_t threadNum, uint32_t queueNum, uint32_t bucketNum,
-                uint32_t delta)
+                uint32_t delta, uint32_t batchSizePop, uint32_t batchSizePush)
 {
     std::atomic<uint64_t> *datas = new std::atomic<uint64_t>[numNodes];
     for (uint i = 0; i < numNodes; i++) {
@@ -296,8 +301,7 @@ void astarMQBucket(Vertex* graph, uint32_t numNodes,
         __builtin_prefetch(&datas[v], 0, 3);
     };
     using MQ_Bucket = BucketMultiQueueIO<decltype(getBucketID), decltype(prefetcher), std::greater<bucket_id>, uint32_t, uint64_t>;
-    // Note: we set batch to 1 for now as astar don't seem to benefit from batching
-    MQ_Bucket wl(getBucketID, prefetcher, queueNum, threadNum, delta, bucketNum, 1, 1, increasing);
+    MQ_Bucket wl(getBucketID, prefetcher, queueNum, threadNum, delta, bucketNum, batchSizePop, batchSizePush, increasing);
     uint64_t node = sourceNode;
     bucket_id b = bucket_id(dist(&graph[sourceNode], &graph[targetNode])) >> delta;
     wl.push(b, node << 32);
@@ -411,7 +415,7 @@ void astarSerial(Vertex* graph, uint32_t numNodes,
                 auto& adjNode = graph[vertex].adj[e];
                 uint32_t dst = adjNode.n;
                 uint32_t nFScore = fScore + adjNode.d_cm;
-                if (targetDist != UINT32_MAX && nFScore > targetDist) continue;
+                if (targetDist <= nFScore) continue;
                 uint32_t d = prios[dst];
                 if (d <= nFScore) continue;
                 prios[dst] = nFScore;
@@ -434,8 +438,8 @@ void astarSerial(Vertex* graph, uint32_t numNodes,
 
 int main(int argc, const char** argv) {
     if (argc < 2) {
-        printf("Usage: %s <inFile> <startNode> <endNode> [qType threadNum bucketNum printFull]\n", argv[0]);
-        printf("Types: Serial / MQIO / MQBucket\n");
+        printf("Usage: %s <inFile> <startNode> <endNode> [qType threadNum bucketNum batchPop batchPush printFull]\n", argv[0]);
+        printf("Types: Serial / MQIO / MQIOPlain / MQBucket\n");
         return -1;
     }
 
@@ -449,7 +453,9 @@ int main(int argc, const char** argv) {
     uint32_t threadNum = (argc > 5) ? atol(argv[5]) : 1;
     uint32_t bucketNum = (argc > 6) ? atol(argv[6]) : 64;
     uint32_t delta = (argc > 7) ? atol(argv[7]) : 0;
-    uint32_t printFull = (argc > 8) ? atol(argv[8]) : 0;
+    uint32_t batchSizePop = (argc > 8) ? atol(argv[8]) : 1;
+    uint32_t batchSizePush = (argc > 9) ? atol(argv[9]) : 1;
+    uint32_t printFull = (argc > 10) ? atol(argv[10]) : 0;
     uint32_t queueNum = threadNum * QUEUES_PER_THREAD;
     printf("Finding shortest path between nodes %d and %d\n", sourceNode, targetNode);
     printf("Type: %s\n", algoType.c_str());
@@ -459,10 +465,14 @@ int main(int argc, const char** argv) {
     printf("delta: %d\n", delta);
 
     if (algoType == "MQIO") {
-        astarMQIO(graph, numNodes, sourceNode, targetNode, threadNum, queueNum);
+        astarMQIO<false>(graph, numNodes, sourceNode, targetNode, threadNum, 
+            queueNum, batchSizePop, batchSizePush);
+    } else if (algoType == "MQIOPlain") {
+        astarMQIO<true>(graph, numNodes, sourceNode, targetNode, threadNum, 
+            queueNum, batchSizePop, batchSizePush);
     } else if (algoType == "MQBucket") {
-        astarMQBucket(graph, numNodes, sourceNode, targetNode, 
-            threadNum, queueNum, bucketNum, delta);
+        astarMQBucket(graph, numNodes, sourceNode, targetNode, threadNum,
+            queueNum, bucketNum, delta, batchSizePop, batchSizePush);
     } else if (algoType == "Serial") {
         astarSerial(graph, numNodes, sourceNode, targetNode);
     } else {
