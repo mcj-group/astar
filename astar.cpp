@@ -32,10 +32,9 @@
  */
 
 constexpr static uint64_t FSCORE_MASK = 0xffffffff;
-constexpr static bucket_id UNDER_BKT = INT64_MAX - 1;
+constexpr static bucket_id UNDER_BKT = - 1;
 
 using PQElement = std::tuple<uint32_t, uint32_t>;
-using BktElement = std::tuple<bucket_id, uint64_t>;
 struct stat {
   uint32_t iter = 0;
   uint32_t emptyWork = 0;
@@ -189,7 +188,15 @@ void MQBucketThreadTask(const Vertex* graph, MQ_Bucket &wl, stat *stats,
 
         uint64_t targetData = datas[targetNode].load(std::memory_order_relaxed);
         uint32_t targetDist = targetData & FSCORE_MASK;
-        uint32_t gScore = poppedBkt << delta;
+        uint32_t gScore;
+
+        if (poppedBkt == UNDER_BKT) {
+            uint64_t d = datas[src].load(std::memory_order_acquire);
+            uint32_t fScore = d & FSCORE_MASK;
+            gScore = fScore + dist(&graph[src], &graph[targetNode]);
+        } else {
+            gScore = poppedBkt << delta;
+        }
         ++iter;
 
         // With the astar definition, our heuristic

@@ -40,6 +40,7 @@
 constexpr static uint64_t BOTTOM32_MASK = 0xffffffff;
 constexpr static uint64_t COMPUTE_TASK_BIT = 0x80000000;
 constexpr static uint64_t VERTEX_ID_MASK = ~COMPUTE_TASK_BIT;
+constexpr static bucket_id UNDER_BKT = - 1;
 
 using PQElement = std::tuple<uint32_t, uint64_t>;
 using BktElement = std::tuple<bucket_id, uint64_t>;
@@ -218,7 +219,17 @@ void MQBucketThreadTask(const Vertex* graph, MQ_Bucket &wl, stat *stats,
         
         uint64_t targetData = datas[targetNode].load(std::memory_order_relaxed);
         uint32_t targetDist = targetData & BOTTOM32_MASK;
-        uint32_t gScore = poppedBkt << delta;
+        uint32_t vertex = task >> 32;
+        uint32_t data = task & BOTTOM32_MASK;
+
+        uint32_t gScore;
+        if (poppedBkt == UNDER_BKT) {
+            uint64_t d = datas[vertex].load(std::memory_order_acquire);
+            uint32_t fScore = d & BOTTOM32_MASK;
+            gScore = fScore + dist(&graph[vertex], &graph[targetNode]);
+        } else {
+            gScore = poppedBkt << delta;
+        }
 
         // With the astar definition, our heuristic
         // will always overestimate. If the current task's
@@ -228,9 +239,6 @@ void MQBucketThreadTask(const Vertex* graph, MQ_Bucket &wl, stat *stats,
             ++emptyWork;
             continue;
         }
-
-        uint32_t vertex = task >> 32;
-        uint32_t data = task & BOTTOM32_MASK;
 
         if (data & COMPUTE_TASK_BIT) {
             // perform floating point computation and enqueue the neighbor
