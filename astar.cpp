@@ -9,9 +9,9 @@
 #include <cassert>
 #include <thread>
 
-#include "BucketQueueTryLock.h"
+#include "MultiBucketQueue.h"
 #include "BucketStructs.h"
-#include "MultiQueueIO.h"
+#include "MultiQueue.h"
 #include "util.h"
 
 /* dsm: A*-search for road maps. Conventions:
@@ -32,7 +32,6 @@
  */
 
 constexpr static uint64_t FSCORE_MASK = 0xffffffff;
-constexpr static bucket_id UNDER_BKT = - 1;
 
 using PQElement = std::tuple<uint32_t, uint32_t>;
 struct stat {
@@ -40,8 +39,8 @@ struct stat {
   uint32_t emptyWork = 0;
 };
 
-template<typename MQ_IO>
-void MQIOThreadTask(const Vertex* graph, MQ_IO &wl, stat *stats,
+template<typename MQ>
+void MQThreadTask(const Vertex* graph, MQ &wl, stat *stats,
                     std::atomic<uint64_t> *datas, 
                     uint32_t sourceNode, uint32_t targetNode)
 {
@@ -101,7 +100,7 @@ void MQIOThreadTask(const Vertex* graph, MQ_IO &wl, stat *stats,
 }
 
 template<bool usePlain> 
-void astarMQIO(Vertex* graph, uint32_t numNodes, 
+void astarMQ(Vertex* graph, uint32_t numNodes, 
                 uint32_t sourceNode, uint32_t targetNode, 
                 uint32_t threadNum, uint32_t queueNum,
                 uint32_t batchSizePop, uint32_t batchSizePush)
@@ -113,12 +112,12 @@ void astarMQIO(Vertex* graph, uint32_t numNodes,
     std::function<void(uint32_t)> prefetcher = [&] (uint32_t v) -> void {
         __builtin_prefetch(&datas[v], 0, 3);
     };
-    using MQ_IO = MultiQueueIO<decltype(prefetcher), std::greater<PQElement>, uint32_t, uint32_t, usePlain>;
+    using MQ = MultiQueue<decltype(prefetcher), std::greater<PQElement>, uint32_t, uint32_t, usePlain>;
     if (usePlain) {
         batchSizePop = 1;
         batchSizePush = 1;
     }
-    MQ_IO wl(prefetcher, queueNum, threadNum, batchSizePop, batchSizePush);
+    MQ wl(prefetcher, queueNum, threadNum, batchSizePop, batchSizePush);
 
     datas[sourceNode] = FSCORE_MASK << 32; // source has no parent
     wl.push(0, sourceNode);
@@ -133,7 +132,7 @@ void astarMQIO(Vertex* graph, uint32_t numNodes,
         uint32_t coreID = i;
         CPU_SET(coreID, &cpuset);
         std::thread *newThread = new std::thread(
-            MQIOThreadTask<MQ_IO>, std::ref(graph), 
+            MQThreadTask<MQ>, std::ref(graph), 
             std::ref(wl), &stats[i], std::ref(datas),
             sourceNode, targetNode
         );
@@ -147,7 +146,7 @@ void astarMQIO(Vertex* graph, uint32_t numNodes,
     CPU_ZERO(&cpuset);
     CPU_SET(0, &cpuset);
     sched_setaffinity(0, sizeof(cpuset), &cpuset);
-    MQIOThreadTask<MQ_IO>(graph, wl, &stats[0], datas, sourceNode, targetNode);
+    MQThreadTask<MQ>(graph, wl, &stats[0], datas, sourceNode, targetNode);
     for (std::thread*& worker : workers) {
         worker->join();
         delete worker;
@@ -177,26 +176,16 @@ void MQBucketThreadTask(const Vertex* graph, MQ_Bucket &wl, stat *stats,
                         uint32_t sourceNode, uint32_t targetNode, uint32_t delta) {
     uint32_t iter = 0UL;
     uint32_t emptyWork = 0UL;
-    uint32_t src;
-    bucket_id poppedBkt;
+    uint32_t src, gScore;
     wl.initTID();
 
     while (true) {
         auto item = wl.pop();
-        if (item) std::tie(poppedBkt, src) = item.get();
+        if (item) std::tie(gScore, src) = item.get();
         else break;
 
         uint64_t targetData = datas[targetNode].load(std::memory_order_relaxed);
         uint32_t targetDist = targetData & FSCORE_MASK;
-        uint32_t gScore;
-
-        if (poppedBkt == UNDER_BKT) {
-            uint64_t d = datas[src].load(std::memory_order_acquire);
-            uint32_t fScore = d & FSCORE_MASK;
-            gScore = fScore + dist(&graph[src], &graph[targetNode]);
-        } else {
-            gScore = poppedBkt << delta;
-        }
         ++iter;
 
         // With the astar definition, our heuristic
@@ -258,7 +247,7 @@ void astarMQBucket(Vertex* graph, uint32_t numNodes,
     std::function<void(uint32_t)> prefetcher = [&] (uint32_t v) -> void {
         __builtin_prefetch(&datas[v], 0, 3);
     };
-    using MQ_Bucket = BucketMultiQueueIO<decltype(getBucketID), decltype(prefetcher), std::greater<bucket_id>, uint32_t, uint32_t>;
+    using MQ_Bucket = MultiBucketQueue<decltype(getBucketID), decltype(prefetcher), std::greater<bucket_id>, uint32_t, uint32_t>;
     MQ_Bucket wl(getBucketID, prefetcher, queueNum, threadNum, delta, bucketNum, batchSizePop, batchSizePush, increasing);
     wl.push(0, sourceNode);
 
@@ -377,7 +366,7 @@ void astarSerial(Vertex* graph, uint32_t numNodes,
 int main(int argc, const char** argv) {
     if (argc < 2) {
         printf("Usage: %s <inFile> <startNode> <endNode> [qType threadNum bucketNum batchPop batchPush printFull]\n", argv[0]);
-        printf("Types: Serial / MQIO / MQIOPlain / MQBucket\n");
+        printf("Types: Serial / MQ / MQPlain / MQBucket\n");
         return -1;
     }
 
@@ -402,11 +391,11 @@ int main(int argc, const char** argv) {
     printf("Buckets: %d\n", bucketNum);
     printf("delta: %d\n", delta);
 
-    if (algoType == "MQIO") {
-        astarMQIO<false>(graph, numNodes, sourceNode, targetNode, threadNum, 
+    if (algoType == "MQ") {
+        astarMQ<false>(graph, numNodes, sourceNode, targetNode, threadNum, 
             queueNum, batchSizePop, batchSizePush);
-    } else if (algoType == "MQIOPlain") {
-        astarMQIO<true>(graph, numNodes, sourceNode, targetNode, threadNum, 
+    } else if (algoType == "MQPlain") {
+        astarMQ<true>(graph, numNodes, sourceNode, targetNode, threadNum, 
             queueNum, batchSizePop, batchSizePush);
     } else if (algoType == "MQBucket") {
         astarMQBucket(graph, numNodes, sourceNode, targetNode, threadNum,
