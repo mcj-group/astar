@@ -199,86 +199,6 @@ void astarMQ(Vertex* graph, uint32_t numNodes,
     }
 }
 
-
-template<typename MQ_Bucket>
-void MQBucketThreadTask(const Vertex* graph, MQ_Bucket &wl, stat *stats,
-                        std::atomic<uint64_t> *datas, 
-                        uint32_t sourceNode, uint32_t targetNode, uint32_t delta) {
-    uint32_t iterVisit = 0;
-    uint32_t iterCompute = 0;
-    uint32_t emptyWork = 0UL;
-    uint32_t gScore;
-    uint64_t task;
-    bucket_id poppedBkt;
-    wl.initTID();
-
-    while (true) {
-        auto item = wl.pop();
-        if (item) std::tie(gScore, task) = item.get();
-        else break;
-        
-        uint64_t targetData = datas[targetNode].load(std::memory_order_relaxed);
-        uint32_t targetDist = targetData & BOTTOM32_MASK;
-
-        // With the astar definition, our heuristic
-        // will always overestimate. If the current task's
-        // gScore is already greater than the targetDist,
-        // then it won't ever lead to a shorter path to target.
-        if (targetDist <= gScore) {
-            ++emptyWork;
-            continue;
-        }
-
-        uint32_t vertex = task >> 32;
-        uint32_t data = task & BOTTOM32_MASK;
-
-        if (data & COMPUTE_TASK_BIT) {
-            // perform floating point computation and enqueue the neighbor
-            ++iterCompute;
-            uint32_t nFScore = data & VERTEX_ID_MASK;
-            uint32_t nGScore = std::max(gScore, nFScore + dist(&graph[vertex], &graph[targetNode]));
-            if (targetDist <= nGScore) continue;
-            uint64_t n = vertex;
-            wl.push(nGScore, n << 32);
-
-        } else {
-            // visit each neighbor and enqueue with the actual distance
-            // to each neighbor, leave the floating point heuristic 
-            // computation to the compute task
-            ++iterVisit;
-            uint64_t srcData = datas[vertex].load(std::memory_order_relaxed);
-            uint32_t fScore = srcData & BOTTOM32_MASK;
-
-            for (uint32_t e = 0; e < graph[vertex].adj.size(); e++) {
-                auto& adjNode = graph[vertex].adj[e];
-                uint32_t dst = adjNode.n;
-                uint32_t nFScore = fScore + adjNode.d_cm;
-                if (targetDist <= nFScore) continue;              
-                uint64_t dstData = datas[dst].load(std::memory_order_relaxed);
-                bool swapped = false;
-                do {
-                    uint32_t dstDist = dstData & BOTTOM32_MASK;
-                    if (dstDist <= nFScore) break;
-                    uint64_t srcShift = vertex;
-                    uint64_t swapVal = (srcShift << 32) | nFScore;
-                    swapped = datas[dst].compare_exchange_weak(
-                        dstData, swapVal,
-                        std::memory_order_acq_rel,
-                        std::memory_order_acquire);
-                } while(!swapped);
-                if (!swapped) continue;
-                uint64_t n = dst;
-                wl.push(poppedBkt, (n << 32 | nFScore | COMPUTE_TASK_BIT));
-
-            }
-        }
-    }
-
-    stats->iterVisit = iterVisit;
-    stats->iterCompute = iterCompute;
-    stats->emptyWork = emptyWork;
-}
-
 void astarMQBucket(Vertex* graph, uint32_t numNodes, 
                 uint32_t sourceNode, uint32_t targetNode, 
                 uint32_t threadNum, uint32_t queueNum, uint32_t bucketNum,
@@ -316,9 +236,9 @@ void astarMQBucket(Vertex* graph, uint32_t numNodes,
         uint32_t coreID = i;
         CPU_SET(coreID, &cpuset);
         std::thread *newThread = new std::thread(
-            MQBucketThreadTask<MQ_Bucket>, std::ref(graph), 
+            MQThreadTask<MQ_Bucket>, std::ref(graph), 
             std::ref(wl), &stats[i], std::ref(datas),
-            sourceNode, targetNode, delta
+            sourceNode, targetNode
         );
         int rc = pthread_setaffinity_np(newThread->native_handle(),
                                         sizeof(cpu_set_t), &cpuset);
@@ -330,7 +250,7 @@ void astarMQBucket(Vertex* graph, uint32_t numNodes,
     CPU_ZERO(&cpuset);
     CPU_SET(0, &cpuset);
     sched_setaffinity(0, sizeof(cpuset), &cpuset);
-    MQBucketThreadTask<MQ_Bucket>(graph, wl, &stats[0], datas, sourceNode, targetNode, delta);
+    MQThreadTask<MQ_Bucket>(graph, wl, &stats[0], datas, sourceNode, targetNode);
     for (std::thread*& worker : workers) {
         worker->join();
         delete worker;

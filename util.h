@@ -113,6 +113,7 @@ uint32_t neighDist(Vertex* graph, uint32_t v, uint32_t w) {
     auto& vnode = graph[v];
     for (Adj a : vnode.adj) if (a.n == w) return a.d_cm;
     assert(false);  // w should be in v's adjacency list
+    return 0;
 }
 
 #endif // ASTAR_UTIL

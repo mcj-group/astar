@@ -169,64 +169,6 @@ void astarMQ(Vertex* graph, uint32_t numNodes,
         cur = parent;
     }
 }
-
-template<typename MQ_Bucket>
-void MQBucketThreadTask(const Vertex* graph, MQ_Bucket &wl, stat *stats,
-                        std::atomic<uint64_t> *datas, 
-                        uint32_t sourceNode, uint32_t targetNode, uint32_t delta) {
-    uint32_t iter = 0UL;
-    uint32_t emptyWork = 0UL;
-    uint32_t src, gScore;
-    wl.initTID();
-
-    while (true) {
-        auto item = wl.pop();
-        if (item) std::tie(gScore, src) = item.get();
-        else break;
-
-        uint64_t targetData = datas[targetNode].load(std::memory_order_relaxed);
-        uint32_t targetDist = targetData & FSCORE_MASK;
-        ++iter;
-
-        // With the astar definition, our heuristic
-        // will always overestimate. If the current task's
-        // gScore is already greater than the targetDist,
-        // then it won't ever lead to a shorter path to target.
-        if (targetDist <= gScore) {
-            ++emptyWork;
-            continue;
-        }
-
-        uint64_t srcData = datas[src].load(std::memory_order_relaxed);
-        uint32_t fScore = srcData & FSCORE_MASK;
-        for (uint32_t e = 0; e < graph[src].adj.size(); e++) {
-            auto& adjNode = graph[src].adj[e];
-            uint32_t dst = adjNode.n;
-            uint32_t nFScore = fScore + adjNode.d_cm;
-            if (targetDist <= nFScore) continue;              
-            uint64_t dstData = datas[dst].load(std::memory_order_relaxed);
-            bool swapped = false;
-            do {
-                uint32_t dstDist = dstData & FSCORE_MASK;
-                if (dstDist <= nFScore) break;
-                uint64_t srcShift = src;
-                uint64_t swapVal = (srcShift << 32) | nFScore;
-                swapped = datas[dst].compare_exchange_weak(
-                    dstData, swapVal,
-                    std::memory_order_acq_rel,
-                    std::memory_order_acquire);
-            } while(!swapped);
-            if (!swapped) continue;
-            uint32_t nGScore = std::max(gScore, nFScore + dist(&graph[dst], &graph[targetNode]));
-            if (targetDist <= nGScore) continue;
-            wl.push(nGScore, dst);
-        }
-    }
-
-    stats->iter = iter;
-    stats->emptyWork = emptyWork;
-}
-
 void astarMQBucket(Vertex* graph, uint32_t numNodes, 
                 uint32_t sourceNode, uint32_t targetNode, 
                 uint32_t threadNum, uint32_t queueNum, uint32_t bucketNum,
@@ -262,9 +204,9 @@ void astarMQBucket(Vertex* graph, uint32_t numNodes,
         CPU_SET(coreID, &cpuset);
         // basic
         std::thread *newThread = new std::thread(
-            MQBucketThreadTask<MQ_Bucket>, std::ref(graph), 
+            MQThreadTask<MQ_Bucket>, std::ref(graph), 
             std::ref(wl), &stats[i], std::ref(datas),
-            sourceNode, targetNode, delta
+            sourceNode, targetNode
         );
         int rc = pthread_setaffinity_np(newThread->native_handle(),
                                         sizeof(cpu_set_t), &cpuset);
@@ -276,7 +218,7 @@ void astarMQBucket(Vertex* graph, uint32_t numNodes,
     CPU_ZERO(&cpuset);
     CPU_SET(0, &cpuset);
     sched_setaffinity(0, sizeof(cpuset), &cpuset);
-    MQBucketThreadTask<MQ_Bucket>(graph, wl, &stats[0], datas, sourceNode, targetNode, delta);
+    MQThreadTask<MQ_Bucket>(graph, wl, &stats[0], datas, sourceNode, targetNode);
     for (std::thread*& worker : workers) {
         worker->join();
         delete worker;
@@ -310,6 +252,8 @@ void astarSerial(Vertex* graph, uint32_t numNodes,
     >;
     PQ wl;
 
+    std::vector<uint32_t> queuesizes;
+
     std::vector<uint32_t> prios(numNodes, UINT32_MAX);
     prios[sourceNode] = 0;
     wl.push(std::make_tuple(0, sourceNode));
@@ -323,6 +267,7 @@ void astarSerial(Vertex* graph, uint32_t numNodes,
     uint32_t maxSize = 0;
     while (!wl.empty()) {
         if (wl.size() > maxSize) maxSize = wl.size();
+        queuesizes.push_back(wl.size());
         std::tie(gScore, src) = wl.top();
         wl.pop();
 
@@ -361,6 +306,15 @@ void astarSerial(Vertex* graph, uint32_t numNodes,
     std::cout << "iter " << iter << "\n";
     std::cout << "empty work " << emptyWork << "\n";
     std::cout << "max size " << maxSize << "\n";
+
+    uint64_t sum = 0;
+    for (uint i = 0; i < queuesizes.size(); i++) {
+        sum += queuesizes[i];
+    }
+    double s = sum;
+    double n = queuesizes.size();
+    double avg = s / n;
+    std::cout << "avg size = " << avg << "\n";
 }
 
 int main(int argc, const char** argv) {
