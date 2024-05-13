@@ -11,16 +11,14 @@ Need to include the CPS repo for MultiQueue and BucketMultiQueue.
 mkdir astar/build
 cd astar/build/
 cmake .. -DCMAKE_BUILD_TYPE=Release
-make astar -j
-make astar_fine_grain -j
+make -j
 
 # in the build folder, run astar like so,
 # arguments must follow this order
 ./astar <inFile> [startNode endNode qType threadNum bucketNum printFull]
 
-# run astar and astar_fine_grain with default arguments on croatia
+# run astar with default arguments on croatia
 ./astar croatia.bin 
-./astar_fine_grain croatia.bin
 
 # run astar serial
 ./astar croatia.bin 0 320970 Serial
@@ -33,7 +31,7 @@ make astar_fine_grain -j
 ```
 
 # Verification
-`astar` and `astar_fine_grain` both output a `path.txt` that prints the path from `startNode` to `targetNode`.
+`astar` outputs a `path.txt` that prints the path from `startNode` to `targetNode`.
 
 To verify the output of a `{map, startNode, targetNode}` configuration:
 ```
