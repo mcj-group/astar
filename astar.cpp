@@ -75,8 +75,10 @@ void MQThreadTask(const Vertex* graph, MQ &wl, stat *stats,
             auto& adjNode = graph[src].adj[e];
             uint32_t dst = adjNode.n;
             uint32_t nFScore = fScore + adjNode.d_cm;
-            if (targetDist <= nFScore) continue;              
+            if (targetDist <= nFScore) continue;
             uint64_t dstData = datas[dst].load(std::memory_order_relaxed);
+
+            // try CAS the neighbor with the new actual distance
             bool swapped = false;
             do {
                 uint32_t dstDist = dstData & FSCORE_MASK;
@@ -89,8 +91,12 @@ void MQThreadTask(const Vertex* graph, MQ &wl, stat *stats,
                     std::memory_order_acquire);
             } while(!swapped);
             if (!swapped) continue;
+
+            // compute new heuristic of the neighbor
             uint32_t nGScore = std::max(gScore, nFScore + dist(&graph[dst], &graph[targetNode]));
             if (targetDist <= nGScore) continue;
+
+            // only push if relaxing this vertex is profitable
             wl.push(nGScore, dst);
         }
     }
@@ -159,6 +165,14 @@ void astarMQ(Vertex* graph, uint32_t numNodes,
     }
 
     wl.stat();
+
+    uint64_t totalIter = 0;
+    uint64_t totalEmptyWork = 0;
+    for (int i = 0; i < threadNum; i++) {
+        totalIter += stats[i].iter;
+        totalEmptyWork += stats[i].emptyWork;
+    }
+    std::cout << "empty work " << totalEmptyWork << "\n";
     std::cout << "runtime_ms " << ms << "\n";
 
     // trace back the path for verification
@@ -169,6 +183,8 @@ void astarMQ(Vertex* graph, uint32_t numNodes,
         cur = parent;
     }
 }
+
+template<bool usePlain> 
 void astarMQBucket(Vertex* graph, uint32_t numNodes, 
                 uint32_t sourceNode, uint32_t targetNode, 
                 uint32_t threadNum, uint32_t queueNum, uint32_t bucketNum,
@@ -180,17 +196,25 @@ void astarMQBucket(Vertex* graph, uint32_t numNodes,
     }
     datas[sourceNode] = FSCORE_MASK << 32; // source has no parent
 
-    std::function<bucket_id(uint32_t)> getBucketID = [&] (uint32_t v) -> bucket_id {
+    std::function<BucketID(uint32_t)> getBucketID = [&] (uint32_t v) -> BucketID {
         uint64_t d = datas[v].load(std::memory_order_acquire);
         uint32_t fScore = d & FSCORE_MASK;
         uint32_t gScore = fScore + dist(&graph[v], &graph[targetNode]);
-        return bucket_id(gScore) >> delta;
+        return BucketID(gScore) >> delta;
     };
     std::function<void(uint32_t)> prefetcher = [&] (uint32_t v) -> void {
         __builtin_prefetch(&datas[v], 0, 3);
     };
-    using MQ_Bucket = MultiBucketQueue<decltype(getBucketID), decltype(prefetcher), std::greater<bucket_id>, uint32_t, uint32_t>;
-    MQ_Bucket wl(getBucketID, prefetcher, queueNum, threadNum, delta, bucketNum, batchSizePop, batchSizePush, increasing);
+    using MQ_Bucket = MultiBucketQueue<
+        decltype(getBucketID), decltype(prefetcher), 
+        std::greater<BucketID>, uint32_t, uint32_t, usePlain
+    >;
+    if (usePlain) {
+        batchSizePop = 1;
+        batchSizePush = 1;
+    }
+    MQ_Bucket wl(getBucketID, prefetcher, queueNum, threadNum, delta, 
+                 bucketNum, batchSizePop, batchSizePush, increasing);
     wl.push(0, sourceNode);
 
     stat stats[threadNum];
@@ -202,7 +226,6 @@ void astarMQBucket(Vertex* graph, uint32_t numNodes,
         CPU_ZERO(&cpuset);
         uint32_t coreID = i;
         CPU_SET(coreID, &cpuset);
-        // basic
         std::thread *newThread = new std::thread(
             MQThreadTask<MQ_Bucket>, std::ref(graph), 
             std::ref(wl), &stats[i], std::ref(datas),
@@ -231,6 +254,14 @@ void astarMQBucket(Vertex* graph, uint32_t numNodes,
     }
 
     wl.stat();
+
+    uint64_t totalIter = 0;
+    uint64_t totalEmptyWork = 0;
+    for (int i = 0; i < threadNum; i++) {
+        totalIter += stats[i].iter;
+        totalEmptyWork += stats[i].emptyWork;
+    }
+    std::cout << "empty work " << totalEmptyWork << "\n";
     std::cout << "runtime_ms " << ms << "\n";
 
     // trace back the path for verification
@@ -291,8 +322,12 @@ void astarSerial(Vertex* graph, uint32_t numNodes,
             if (targetDist <= nFScore) continue;
             uint32_t d = prios[dst];
             if (d <= nFScore) continue;
+
+            // compute new heuristic of the neighbor
             uint32_t nGScore = std::max(gScore, nFScore + dist(&graph[dst], &graph[targetNode]));
             if (targetDist <= nGScore) continue;
+
+            // only push if relaxing this vertex is profitable
             prios[dst] = nFScore;
             graph[dst].prev = src;
             wl.push({nGScore, dst});
@@ -319,8 +354,9 @@ void astarSerial(Vertex* graph, uint32_t numNodes,
 
 int main(int argc, const char** argv) {
     if (argc < 2) {
-        printf("Usage: %s <inFile> <startNode> <endNode> [qType threadNum bucketNum batchPop batchPush printFull]\n", argv[0]);
-        printf("Types: Serial / MQ / MQPlain / MQBucket\n");
+        printf("Usage: %s <inFile> <startNode> <endNode> ", argv[0]);
+        printf("[qType threadNum bucketNum batchPop batchPush printFull]\n");
+        printf("Types: Serial / MQ / MQPlain / MQBucket / MQBucketPlain\n");
         return -1;
     }
 
@@ -352,7 +388,10 @@ int main(int argc, const char** argv) {
         astarMQ<true>(graph, numNodes, sourceNode, targetNode, threadNum, 
             queueNum, batchSizePop, batchSizePush);
     } else if (algoType == "MQBucket") {
-        astarMQBucket(graph, numNodes, sourceNode, targetNode, threadNum,
+        astarMQBucket<false>(graph, numNodes, sourceNode, targetNode, threadNum,
+            queueNum, bucketNum, delta, batchSizePop, batchSizePush);
+    } else if (algoType == "MQBucketPlain") {
+        astarMQBucket<true>(graph, numNodes, sourceNode, targetNode, threadNum,
             queueNum, bucketNum, delta, batchSizePop, batchSizePush);
     } else if (algoType == "Serial") {
         astarSerial(graph, numNodes, sourceNode, targetNode);
