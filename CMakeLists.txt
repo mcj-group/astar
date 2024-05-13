@@ -10,6 +10,3 @@ include_directories(${CMAKE_CURRENT_SOURCE_DIR}/../CPS/include)
 
 add_executable(astar "astar.cpp" "util.h")
 target_link_libraries(astar pthread ${Boost_LIBRARIES})
-
-add_executable(astar_fine_grain "astar_fine_grain.cpp" "util.h")
-target_link_libraries(astar_fine_grain pthread ${Boost_LIBRARIES})
