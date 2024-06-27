@@ -207,7 +207,7 @@ void astarMQBucket(Vertex* graph, uint32_t numNodes,
     };
     using MQ_Bucket = MultiBucketQueue<
         decltype(getBucketID), decltype(prefetcher), 
-        std::greater<BucketID>, uint32_t, uint32_t, usePlain
+        std::greater<BucketID>, uint32_t, uint32_t, usePlain, true
     >;
     if (usePlain) {
         batchSizePop = 1;
