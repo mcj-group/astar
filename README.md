@@ -15,7 +15,7 @@ make -j
 
 # in the build folder, run astar like so,
 # arguments must follow this order
-./astar <inFile> [startNode endNode qType threadNum bucketNum printFull]
+./astar <inFile> [startNode endNode qType threadNum queueNum batchPop batchPush delta bucketNum printFull]
 
 # run astar with default arguments on croatia
 ./astar croatia.bin 
@@ -26,8 +26,8 @@ make -j
 # run astar with MultiQueue and 16 threads
 ./astar croatia.bin 0 320970 MQIO 16
 
-# run astar with BucketMQ, 16 threads, 128 buckets, and delta of 10
-./astar croatia.bin 0 320970 MQBucket 16 128 10 
+# run astar with BucketMQ, 16 threads, 64 queues, batchsizes of 4, delta of 11 and 64 buckets per bucket queue
+./astar croatia.bin 0 320970 MQBucket 16 64 4 4 11 64 
 ```
 
 # Verification

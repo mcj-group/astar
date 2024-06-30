@@ -305,7 +305,7 @@ int main(int argc, const char** argv) {
     uint32_t targetNode = (argc > 3) ? std::min((uint32_t)atoi(argv[3]), numNodes-1) : 9*numNodes/10;
     std::string qType = (argc > 4) ? argv[4] : "Serial";
     uint32_t threadNum = (argc > 5) ? atol(argv[5]) : 1;
-    uint32_t queueNum = (argc > 6) ? atol(argv[6]) : 1;
+    uint32_t queueNum = (argc > 6) ? atol(argv[6]) : threadNum * 4;
     uint32_t batchSizePop = (argc > 7) ? atol(argv[7]) : 1;
     uint32_t batchSizePush = (argc > 8) ? atol(argv[8]) : 1;
     uint32_t delta = (argc > 9) ? atol(argv[9]) : 10;
