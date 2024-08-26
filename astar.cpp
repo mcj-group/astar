@@ -33,6 +33,19 @@
 
 constexpr static uint64_t FSCORE_MASK = 0xffffffff;
 
+/* Vector stuff ================================== */
+#include <immintrin.h>
+
+/* Knobs */
+/*     Mask Option (default orig) */
+#define AWU_MASK_SCALAR
+
+constexpr uint32_t countr_zero(uint32_t x) noexcept {
+  return (x) ? ((uint32_t)(__builtin_ctz(x))) : ((uint32_t)(sizeof(uint32_t) * 8));
+}
+/* ================================================ */
+
+
 using PQElement = std::tuple<uint32_t, uint32_t>;
 struct stat {
   uint32_t iter = 0;
@@ -71,6 +84,53 @@ void MQThreadTask(const Vertex* graph, MQ &wl, stat *stats,
         uint64_t srcData = data[src].load(std::memory_order_relaxed);
         uint32_t fScore = srcData & FSCORE_MASK;
 
+#ifdef AWU_MASK_SCALAR // mask opt
+        uint32_t eBegin = 0;
+        uint32_t eEnd = graph[src].adj.size();
+        constexpr uint32_t B = 8;   // 4 avx2 instructions long
+        for (uint32_t e = 0; e < eEnd; e += B) {
+            uint32_t mask = 0;
+            for (auto f = e; f != std::min(e + B, eEnd); f++) {
+                auto& adjNode = graph[src].adj[f];
+                uint32_t dst = adjNode.n;
+                uint32_t nFScore = fScore + adjNode.d_cm;
+                bool cmp = targetDist > nFScore;
+                mask |= cmp << (f - e);
+            }
+            for (uint32_t i = countr_zero(mask);
+               i < B;
+               i = countr_zero(mask & (UINT64_MAX << (i + 1)))) {
+                auto& adjNode = graph[src].adj[e+i];
+                uint32_t dst = adjNode.n;
+                uint32_t nFScore = fScore + adjNode.d_cm;
+
+                if (targetDist <= nFScore) continue;
+                uint64_t dstData = data[dst].load(std::memory_order_relaxed);
+
+                // try CAS the neighbor with the new actual distance
+                bool swapped = false;
+                do {
+                    uint32_t dstDist = dstData & FSCORE_MASK;
+                    if (dstDist <= nFScore) break;
+                    uint64_t srcShift = src;
+                    uint64_t swapVal = (srcShift << 32) | nFScore;
+                    swapped = data[dst].compare_exchange_weak(
+                        dstData, swapVal,
+                        std::memory_order_acq_rel,
+                        std::memory_order_acquire);
+                } while(!swapped);
+                if (!swapped) continue;
+
+                // compute new heuristic of the neighbor
+                uint32_t nGScore = std::max(gScore, nFScore + dist(&graph[dst], &graph[targetNode]));
+                if (targetDist <= nGScore) continue;
+
+                // only push if relaxing this vertex is profitable
+                wl.push(nGScore, dst);
+            }
+        }
+
+#else
         for (uint32_t e = 0; e < graph[src].adj.size(); e++) {
             auto& adjNode = graph[src].adj[e];
             uint32_t dst = adjNode.n;
@@ -99,6 +159,7 @@ void MQThreadTask(const Vertex* graph, MQ &wl, stat *stats,
             // only push if relaxing this vertex is profitable
             wl.push(nGScore, dst);
         }
+#endif // mask opt
     }
 
     stats->iter = iter;
