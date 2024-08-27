@@ -423,24 +423,24 @@ void astarMQ(Vertex* graph, std::string qType, uint32_t numNodes,
     if (qType == "MQBucket") {
         printf("delta: %d\n", delta);
         printf("Buckets: %d\n", bucketNum);
-        std::function<BucketID(uint32_t)> getBucketID = [&] (uint32_t v) -> BucketID {
+        std::function<mbq::BucketID(uint32_t)> getBucketID = [&] (uint32_t v) -> mbq::BucketID {
             uint64_t d = data[v].load(std::memory_order_acquire);
             uint32_t fScore = d & FSCORE_MASK;
             uint32_t gScore = fScore + dist(&graph[v], &graph[targetNode]);
-            return BucketID(gScore) >> delta;
+            return mbq::BucketID(gScore) >> delta;
         };
-        using MQ_Bucket = MultiBucketQueue<
+        using MQ_Bucket = mbq::MultiBucketQueue<
             decltype(getBucketID), decltype(prefetcher), 
-            std::greater<BucketID>, uint32_t, uint32_t, true, true
+            std::greater<mbq::BucketID>, uint32_t, uint32_t, true, true
         >;
         MQ_Bucket wl(getBucketID, prefetcher, queueNum, threadNum, delta, 
-                     bucketNum, batchSizePop, batchSizePush, increasing);
+                     bucketNum, batchSizePop, batchSizePush, mbq::increasing);
         wl.push(0, sourceNode);
         spawnTasks<MQ_Bucket>(graph, wl, data, threadNum, sourceNode, targetNode);  
 
     } else {
         // qType == MQ
-        using MQ = MultiQueue<decltype(prefetcher), std::greater<PQElement>, uint32_t, uint32_t>;
+        using MQ = mbq::MultiQueue<decltype(prefetcher), std::greater<PQElement>, uint32_t, uint32_t>;
         MQ wl(prefetcher, queueNum, threadNum, batchSizePop, batchSizePush);
         wl.push(0, sourceNode);
         spawnTasks<MQ>(graph, wl, data, threadNum, sourceNode, targetNode);  
