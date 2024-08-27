@@ -38,11 +38,45 @@ constexpr static uint64_t FSCORE_MASK = 0xffffffff;
 
 /* Knobs */
 /*     Mask Option (default orig) */
-#define AWU_MASK_SCALAR
+// #define AWU_MASK_SCALAR
+#define AWU_MASK_VECTOR
 
+/*     Vectorization Scheme (no default) */
+// #define AWU_VECSCHEME_ALWAYS   // vecld: always use vector instructions to construct mask. Use inner mask to not-gather the excess vector elements
+#define AWU_VECSCHEME_FILLVEC  // dynvec angus: vectorize only if (vertex.remaining_edges >= Bee), fill Bee-wide vector with Bee/(8) loops of vgather, else scalar
+// #define AWU_VECSCHEME_MOSTOFVEC   // dynvec mcj: Bee-bit-wide mask, vectorize (vertex.remaining_edges // (8) ) times, scalar (vertex.remaining_edges % (8) times)
+
+/*     Mask Width (default 32) (does not affect AWU_VECSCHEME_ALWAYS) */
+// #define AWU_MASKWIDTH_64
+
+#ifdef AWU_MASKWIDTH_64
+constexpr uint32_t B = 64;   // 8 avx2 instructions long: avx2: 256b / uint32_t = (8)
+constexpr __uint128_t UINT128_MAX =__uint128_t(__int128_t(-1L));
+#elif defined(AWU_VECSCHEME_ALWAYS)
+constexpr uint32_t B = 8;   // 1 avx2 instructions long
+#else
+constexpr uint32_t B = 32;   // 4 avx2 instructions long
+#endif
+
+/* Functions */
+static inline __m256i shiftToMask256(uint8_t shift) {
+  int mask = 0xffu >> shift;
+  // shift each bit of the mask into the msb of its corresponding element
+  __m256i vmask = _mm256_set1_epi32(mask);                 // copy mask into all 32b elements
+  const __m256i shift_count = _mm256_setr_epi32(31, 30, 29, 28, 27, 26, 25, 24); // reverse order: MSB [24,...,31] LSB
+  __m256i msb_mask = _mm256_sllv_epi32(vmask, shift_count); // shift each mask bit up to its element's msb
+  return msb_mask;
+}
+
+#ifdef AWU_MASKWIDTH_64
+constexpr uint32_t countr_zero(uint64_t x) noexcept {
+  return (x) ? ((uint32_t)(__builtin_ctzl(x))) : ((uint32_t)(sizeof(uint64_t) * 8));
+}
+#else
 constexpr uint32_t countr_zero(uint32_t x) noexcept {
   return (x) ? ((uint32_t)(__builtin_ctz(x))) : ((uint32_t)(sizeof(uint32_t) * 8));
 }
+#endif
 /* ================================================ */
 
 
@@ -88,11 +122,14 @@ void MQThreadTask(const Vertex* graph, MQ &wl, stat *stats,
         uint32_t eBegin = 0;
         uint32_t eEnd = graph[src].adj.size();
         constexpr uint32_t B = 8;   // 4 avx2 instructions long
+        Adj * adjbase = const_cast<Adj *>(reinterpret_cast<const Adj*>(&graph[src].adj[0]));
+        static_assert(sizeof(graph[src].adj[0]) == sizeof(uint64_t));
+        targetDist = targetDist >> 1;
+
         for (uint32_t e = 0; e < eEnd; e += B) {
             uint32_t mask = 0;
             for (auto f = e; f != std::min(e + B, eEnd); f++) {
-                auto& adjNode = graph[src].adj[f];
-                uint32_t dst = adjNode.n;
+                auto& adjNode = *(adjbase + f);
                 uint32_t nFScore = fScore + adjNode.d_cm;
                 bool cmp = targetDist > nFScore;
                 mask |= cmp << (f - e);
@@ -100,7 +137,156 @@ void MQThreadTask(const Vertex* graph, MQ &wl, stat *stats,
             for (uint32_t i = countr_zero(mask);
                i < B;
                i = countr_zero(mask & (UINT64_MAX << (i + 1)))) {
-                auto& adjNode = graph[src].adj[e+i];
+                auto& adjNode = *(adjbase + e + i);
+                uint32_t dst = adjNode.n;
+                uint32_t nFScore = fScore + adjNode.d_cm;
+
+                if (targetDist <= nFScore) continue;
+                uint64_t dstData = data[dst].load(std::memory_order_relaxed);
+
+                // try CAS the neighbor with the new actual distance
+                bool swapped = false;
+                do {
+                    uint32_t dstDist = dstData & FSCORE_MASK;
+                    if (dstDist <= nFScore) break;
+                    uint64_t srcShift = src;
+                    uint64_t swapVal = (srcShift << 32) | nFScore;
+                    swapped = data[dst].compare_exchange_weak(
+                        dstData, swapVal,
+                        std::memory_order_acq_rel,
+                        std::memory_order_acquire);
+                } while(!swapped);
+                if (!swapped) continue;
+
+                // compute new heuristic of the neighbor
+                uint32_t nGScore = std::max(gScore, nFScore + dist(&graph[dst], &graph[targetNode]));
+                if (targetDist <= nGScore) continue;
+
+                // only push if relaxing this vertex is profitable
+                wl.push(nGScore, dst);
+            }
+        }
+#elif defined(AWU_MASK_VECTOR) // mask opt
+        uint32_t eBegin = 0;
+        uint32_t eEnd = graph[src].adj.size();
+        constexpr uint32_t B = 8;   // 4 avx2 instructions long
+        const int * adjbase = reinterpret_cast<const int*>(&graph[src].adj[0]);
+        // treat type Adj (64b struct) as {uint32_t, uint32_t} *(note)
+        // auto& adjNode = *(adjbase + f);
+        // type Adj is struct {uint32_t n , uint32_t d_cm} @ word 0 and word 1
+        // so Adj[i] := uint64_t[i] = uint32_t[2*i] 
+        static_assert(sizeof(graph[src].adj[0]) == sizeof(uint64_t));
+
+        targetDist = targetDist >> 1;
+        __m256i targetDists = _mm256_set1_epi32(targetDist);
+        static_assert(sizeof(targetDist) == sizeof(uint32_t));
+        __m256i fScores = _mm256_set1_epi32(fScore);
+        static_assert(sizeof(fScore) == sizeof(uint32_t));
+
+        for (uint32_t e = 0; e < eEnd; e += B) {
+#   ifdef AWU_VECSCHEME_ALWAYS // vec scheme
+            __m256i es = _mm256_set1_epi32(e);  // *(note)
+            __m256i offsets = _mm256_set_epi32(15, 13, 11, 9, 7, 5, 3, 1);
+            __m256i indices = _mm256_add_epi32(es, offsets);
+
+            uint8_t shift = ((e + B < eEnd) ? 0 : ((e+B) - eEnd));
+            __m256i innermask = shiftToMask256(shift);
+
+            __m256i dcms = _mm256_mask_i32gather_epi32(_mm256_setzero_si256(), adjbase, indices, innermask, 4);
+
+            __m256i nFScores = _mm256_add_epi32(fScores, dcms);
+
+            __m256i cmp = _mm256_cmpgt_epi32(targetDists, nFScores); // each arg: 1s if new < old, *compares signed ints
+            __m256 cmp_cast = _mm256_castsi256_ps(cmp);           // concat msb of each 32b int
+            uint32_t mask_prep = static_cast<uint32_t>(_mm256_movemask_ps(cmp_cast));
+            uint32_t mask = mask_prep & static_cast<uint32_t>(0xffu >> shift);
+
+#   elif defined(AWU_VECSCHEME_FILLVEC) // vec scheme
+#       ifdef AWU_MASKWIDTH_64
+            uint64_t mask = 0;
+#       else
+            uint32_t mask = 0;
+#       endif
+            if (e+B < eEnd) {
+                for (auto f = e; f < e+B; f += 8) {
+                    __m256i fs = _mm256_set1_epi32(f);  // *(note)
+                    __m256i offsets = _mm256_set_epi32(15, 13, 11, 9, 7, 5, 3, 1);
+                    __m256i indices = _mm256_add_epi32(fs, offsets);
+
+                    __m256i dcms = _mm256_mask_i32gather_epi32(_mm256_setzero_si256(), adjbase, indices, _mm256_set1_epi64x(-1), 4);
+
+                    __m256i nFScores = _mm256_add_epi32(fScores, dcms);
+
+                    __m256i cmp = _mm256_cmpgt_epi32(targetDists, nFScores); // each arg: 1s if new < old, *compares signed ints
+                    __m256 cmp_cast = _mm256_castsi256_ps(cmp);           // concat msb of each 32b int
+                    uint8_t shift = ((e + B < eEnd) ? 0 : ((e+B) - eEnd));
+#       ifdef AWU_MASKWIDTH_64
+                    uint64_t mask_prep = static_cast<uint64_t>(_mm256_movemask_ps(cmp_cast));
+                    mask |= static_cast<uint64_t>((mask_prep & static_cast<uint64_t>(0xffu >> shift)) << (f - e));
+#       else
+                    uint32_t mask_prep = static_cast<uint32_t>(_mm256_movemask_ps(cmp_cast));
+                    mask |= static_cast<uint32_t>((mask_prep & static_cast<uint32_t>(0xffu >> shift)) << (f - e));
+#       endif
+                }
+            } else {
+                for (auto f = e; f != std::min(e + B, eEnd); f++) {
+                    const Adj & adjNode = *reinterpret_cast<const Adj*>(adjbase + f);
+                    uint32_t nFScore = fScore + adjNode.d_cm;
+#       ifdef AWU_MASKWIDTH_64
+                    uint64_t cmp = static_cast<uint64_t>(targetDist > nFScore);
+                    mask |= static_cast<uint64_t>(cmp << (f - e));
+#       else
+                    uint32_t cmp = static_cast<uint32_t>(targetDist > nFScore);
+                    mask |= static_cast<uint32_t>(cmp << (f - e));
+#       endif
+                }
+            }
+
+#   elif defined(AWU_VECSCHEME_MOSTOFVEC) // vec scheme
+#       ifdef AWU_MASKWIDTH_64
+            uint64_t mask = 0;
+#       else
+            uint32_t mask = 0;
+#       endif
+            auto f = e;
+            for(; f + 8 < std::min(e + B, eEnd); f += 8) {
+                __m256i fs = _mm256_set1_epi32(f);  // *(note)
+                __m256i offsets = _mm256_set_epi32(15, 13, 11, 9, 7, 5, 3, 1);
+                __m256i indices = _mm256_add_epi32(fs, offsets);
+
+                __m256i dcms = _mm256_mask_i32gather_epi32(_mm256_setzero_si256(), adjbase, indices, _mm256_set1_epi64x(-1), 4);
+
+                __m256i nFScores = _mm256_add_epi32(fScores, dcms);
+
+                __m256i cmp = _mm256_cmpgt_epi32(targetDists, nFScores); // each arg: 1s if new < old, *compares signed ints
+                __m256 cmp_cast = _mm256_castsi256_ps(cmp);           // concat msb of each 32b int
+                uint8_t shift = ((e + B < eEnd) ? 0 : ((e+B) - eEnd));
+#       ifdef AWU_MASKWIDTH_64
+                uint64_t mask_prep = static_cast<uint64_t>(_mm256_movemask_ps(cmp_cast));
+                mask |= static_cast<uint64_t>((mask_prep & static_cast<uint64_t>(0xffu >> shift)) << (f - e));
+#       else
+                uint32_t mask_prep = static_cast<uint32_t>(_mm256_movemask_ps(cmp_cast));
+                mask |= static_cast<uint32_t>((mask_prep & static_cast<uint32_t>(0xffu >> shift)) << (f - e));
+#       endif
+            }
+            for (; f != std::min(e + B, eEnd); f++) {
+                const Adj & adjNode = *reinterpret_cast<const Adj*>(adjbase + f);
+                uint32_t nFScore = fScore + adjNode.d_cm;
+#       ifdef AWU_MASKWIDTH_64
+                uint64_t cmp = static_cast<uint64_t>(targetDist > nFScore);
+                mask |= static_cast<uint64_t>(cmp << (f - e));
+#       else
+                uint32_t cmp = static_cast<uint32_t>(targetDist > nFScore);
+                mask |= static_cast<uint32_t>(cmp << (f - e));
+#       endif
+            }
+
+#   endif // vec scheme
+            Adj * adjbase = const_cast<Adj *>(reinterpret_cast<const Adj*>(&graph[src].adj[0]));
+            for (uint32_t i = countr_zero(mask);
+               i < B;
+               i = countr_zero(mask & (UINT64_MAX << (i + 1)))) {
+                const Adj & adjNode = *reinterpret_cast<const Adj*>(adjbase + e + i);
                 uint32_t dst = adjNode.n;
                 uint32_t nFScore = fScore + adjNode.d_cm;
 
@@ -378,6 +564,30 @@ int main(int argc, const char** argv) {
     printf("Queues: %d\n", queueNum);
     printf("batchSizePop: %d\n", batchSizePop);
     printf("batchSizePush: %d\n", batchSizePush);
+
+    std::cout << "Vectorization:";
+#ifdef AWU_MASK_SCALAR
+    std::cout << " Scalar";
+#elif defined(AWU_MASK_VECTOR)
+    std::cout << " Vector";
+#   ifdef AWU_VECSCHEME_ALWAYS
+    std::cout << " Always";
+#   elif defined(AWU_VECSCHEME_FILLVEC)
+    std::cout << " FillVec";
+#   elif defined(AWU_VECSCHEME_MOSTOFVEC)
+    std::cout << " MostOfVec";
+#   else
+    std::cout << "\nError no vec scheme";
+#   endif
+#   ifdef AWU_MASKWIDTH_64
+    std::cout << " MaskWidth-64b";
+#   else
+    std::cout << " MaskWidth-Default32b";
+#   endif
+#else
+    std::cout << " Orig";
+#endif
+    std::cout << std::endl;
 
     if (qType == "Serial") {
         astarSerial(graph, numNodes, sourceNode, targetNode);

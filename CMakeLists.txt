@@ -9,4 +9,5 @@ set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} -O3")
 include_directories(${CMAKE_CURRENT_SOURCE_DIR}/../CPS/include)
 
 add_executable(astar "astar.cpp" "util.h")
+target_compile_options(astar PUBLIC "-mavx2")
 target_link_libraries(astar pthread ${Boost_LIBRARIES})
