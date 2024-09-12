@@ -55,7 +55,7 @@ void MQThreadTask(const Vertex* graph, MQ &wl, stat *stats,
         if (item) std::tie(gScore, src) = item.get();
         else break;
 
-        uint64_t targetData = data[targetNode].load(std::memory_order_relaxed);
+        uint64_t targetData = data[targetNode].load(std::memory_order_seq_cst);
         uint32_t targetDist = targetData & FSCORE_MASK;
         ++iter;
 
@@ -68,7 +68,7 @@ void MQThreadTask(const Vertex* graph, MQ &wl, stat *stats,
             continue;
         }
 
-        uint64_t srcData = data[src].load(std::memory_order_relaxed);
+        uint64_t srcData = data[src].load(std::memory_order_seq_cst);
         uint32_t fScore = srcData & FSCORE_MASK;
 
         for (uint32_t e = 0; e < graph[src].adj.size(); e++) {
@@ -76,7 +76,7 @@ void MQThreadTask(const Vertex* graph, MQ &wl, stat *stats,
             uint32_t dst = adjNode.n;
             uint32_t nFScore = fScore + adjNode.d_cm;
             if (targetDist <= nFScore) continue;
-            uint64_t dstData = data[dst].load(std::memory_order_relaxed);
+            uint64_t dstData = data[dst].load(std::memory_order_seq_cst);
 
             // try CAS the neighbor with the new actual distance
             bool swapped = false;
@@ -87,8 +87,8 @@ void MQThreadTask(const Vertex* graph, MQ &wl, stat *stats,
                 uint64_t swapVal = (srcShift << 32) | nFScore;
                 swapped = data[dst].compare_exchange_weak(
                     dstData, swapVal,
-                    std::memory_order_acq_rel,
-                    std::memory_order_acquire);
+                    std::memory_order_seq_cst,
+                    std::memory_order_seq_cst);
             } while(!swapped);
             if (!swapped) continue;
 
@@ -165,7 +165,7 @@ void astarMQ(Vertex* graph, std::string qType, uint32_t numNodes,
 {
     std::atomic<uint64_t> *data = new std::atomic<uint64_t>[numNodes];
     for (uint i = 0; i < numNodes; i++) {
-        data[i].store(UINT64_MAX, std::memory_order_relaxed);
+        data[i].store(UINT64_MAX, std::memory_order_seq_cst);
     }
     data[sourceNode] = FSCORE_MASK << 32; // source has no parent
 
@@ -177,7 +177,7 @@ void astarMQ(Vertex* graph, std::string qType, uint32_t numNodes,
         printf("delta: %d\n", delta);
         printf("Buckets: %d\n", bucketNum);
         std::function<mbq::BucketID(uint32_t)> getBucketID = [&] (uint32_t v) -> mbq::BucketID {
-            uint64_t d = data[v].load(std::memory_order_acquire);
+            uint64_t d = data[v].load(std::memory_order_seq_cst);
             uint32_t fScore = d & FSCORE_MASK;
             uint32_t gScore = fScore + dist(&graph[v], &graph[targetNode]);
             return mbq::BucketID(gScore) >> delta;
@@ -202,7 +202,7 @@ void astarMQ(Vertex* graph, std::string qType, uint32_t numNodes,
     // trace back the path for verification
     uint32_t cur = targetNode;
     while (cur != sourceNode) {
-        uint32_t parent = data[cur].load(std::memory_order_relaxed) >> 32;
+        uint32_t parent = data[cur].load(std::memory_order_seq_cst) >> 32;
         graph[cur].prev = parent;
         cur = parent;
     }
