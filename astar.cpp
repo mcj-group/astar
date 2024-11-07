@@ -31,7 +31,7 @@
  *  | parent | fscore |
  */
 
-constexpr static uint64_t FSCORE_MASK = 0xffffffff;
+constexpr static uint64_t FSCORE_MASK = 0x7fffffff; // exclude msb for vector signed compares, to prevent wraparound negatives
 
 /* Vector stuff ================================== */
 #include <immintrin.h>
@@ -42,8 +42,8 @@ constexpr static uint64_t FSCORE_MASK = 0xffffffff;
 #define AWU_MASK_VECTOR
 
 /*     Vectorization Scheme (no default) */
-// #define AWU_VECSCHEME_ALWAYS   // vecld: always use vector instructions to construct mask. Use inner mask to not-gather the excess vector elements
-#define AWU_VECSCHEME_FILLVEC  // dynvec angus: vectorize only if (vertex.remaining_edges >= Bee), fill Bee-wide vector with Bee/(8) loops of vgather, else scalar
+#define AWU_VECSCHEME_ALWAYS   // vecld: always use vector instructions to construct mask. Use inner mask to not-gather the excess vector elements
+// #define AWU_VECSCHEME_FILLVEC  // dynvec angus: vectorize only if (vertex.remaining_edges >= Bee), fill Bee-wide vector with Bee/(8) loops of vgather, else scalar
 // #define AWU_VECSCHEME_MOSTOFVEC   // dynvec mcj: Bee-bit-wide mask, vectorize (vertex.remaining_edges // (8) ) times, scalar (vertex.remaining_edges % (8) times)
 
 /*     Mask Width (default 32) (does not affect AWU_VECSCHEME_ALWAYS) */
@@ -60,6 +60,7 @@ constexpr uint32_t B = 32;   // 4 avx2 instructions long
 
 /* Functions */
 static inline __m256i shiftToMask256(uint8_t shift) {
+  // for the lower <shift> elements, set most sig bit to 1
   int mask = 0xffu >> shift;
   // shift each bit of the mask into the msb of its corresponding element
   __m256i vmask = _mm256_set1_epi32(mask);                 // copy mask into all 32b elements
@@ -124,7 +125,6 @@ void MQThreadTask(const Vertex* graph, MQ &wl, stat *stats,
         constexpr uint32_t B = 8;   // 4 avx2 instructions long
         Adj * adjbase = const_cast<Adj *>(reinterpret_cast<const Adj*>(&graph[src].adj[0]));
         static_assert(sizeof(graph[src].adj[0]) == sizeof(uint64_t));
-        targetDist = targetDist >> 1;
 
         for (uint32_t e = 0; e < eEnd; e += B) {
             uint32_t mask = 0;
@@ -134,6 +134,7 @@ void MQThreadTask(const Vertex* graph, MQ &wl, stat *stats,
                 bool cmp = targetDist > nFScore;
                 mask |= cmp << (f - e);
             }
+
             for (uint32_t i = countr_zero(mask);
                i < B;
                i = countr_zero(mask & (UINT64_MAX << (i + 1)))) {
@@ -177,7 +178,6 @@ void MQThreadTask(const Vertex* graph, MQ &wl, stat *stats,
         // so Adj[i] := uint64_t[i] = uint32_t[2*i] 
         static_assert(sizeof(graph[src].adj[0]) == sizeof(uint64_t));
 
-        targetDist = targetDist >> 1;
         __m256i targetDists = _mm256_set1_epi32(targetDist);
         static_assert(sizeof(targetDist) == sizeof(uint32_t));
         __m256i fScores = _mm256_set1_epi32(fScore);
@@ -185,6 +185,8 @@ void MQThreadTask(const Vertex* graph, MQ &wl, stat *stats,
 
         for (uint32_t e = 0; e < eEnd; e += B) {
 #   ifdef AWU_VECSCHEME_ALWAYS // vec scheme
+            // type Adj is struct {uint32_t n , uint32_t d_cm} @ word 0 and word 1
+            // gather a vector of d_cm's, which is every odd indexed uint32_t
             __m256i es = _mm256_set1_epi32(e);  // *(note)
             __m256i offsets = _mm256_set_epi32(15, 13, 11, 9, 7, 5, 3, 1);
             __m256i indices = _mm256_add_epi32(es, offsets);
@@ -209,9 +211,11 @@ void MQThreadTask(const Vertex* graph, MQ &wl, stat *stats,
 #       endif
             if (e+B < eEnd) {
                 for (auto f = e; f < e+B; f += 8) {
+                    // type Adj is struct {uint32_t n , uint32_t d_cm} @ word 0 and word 1
+                    // gather a vector of d_cm's, which is every odd indexed uint32_t
                     __m256i fs = _mm256_set1_epi32(f);  // *(note)
                     __m256i offsets = _mm256_set_epi32(15, 13, 11, 9, 7, 5, 3, 1);
-                    __m256i indices = _mm256_add_epi32(fs, offsets);
+                    __m256i indices = _mm256_add_epi32(fs, offsets);                // offset each f by 1,3,5... to get f.d_cm
 
                     __m256i dcms = _mm256_mask_i32gather_epi32(_mm256_setzero_si256(), adjbase, indices, _mm256_set1_epi64x(-1), 4);
 
@@ -250,9 +254,11 @@ void MQThreadTask(const Vertex* graph, MQ &wl, stat *stats,
 #       endif
             auto f = e;
             for(; f + 8 < std::min(e + B, eEnd); f += 8) {
-                __m256i fs = _mm256_set1_epi32(f);  // *(note)
+                // type Adj is struct {uint32_t n , uint32_t d_cm} @ word 0 and word 1
+                // gather a vector of d_cm's, which is every odd indexed uint32_t
+                __m256i fs = _mm256_set1_epi32(f);
                 __m256i offsets = _mm256_set_epi32(15, 13, 11, 9, 7, 5, 3, 1);
-                __m256i indices = _mm256_add_epi32(fs, offsets);
+                __m256i indices = _mm256_add_epi32(fs, offsets);                // offset each f by 1,3,5... to get f.d_cm
 
                 __m256i dcms = _mm256_mask_i32gather_epi32(_mm256_setzero_si256(), adjbase, indices, _mm256_set1_epi64x(-1), 4);
 
@@ -288,9 +294,10 @@ void MQThreadTask(const Vertex* graph, MQ &wl, stat *stats,
                i = countr_zero(mask & (UINT64_MAX << (i + 1)))) {
                 const Adj & adjNode = *reinterpret_cast<const Adj*>(adjbase + e + i);
                 uint32_t dst = adjNode.n;
-                uint32_t nFScore = fScore + adjNode.d_cm;
+                uint32_t nFScore = fScore + adjNode.d_cm; // does this change from prev loop?
+                                                          // this is fp, might be worth memoizing
 
-                if (targetDist <= nFScore) continue;
+                if (targetDist <= nFScore) continue; // if does not change, can remove this cond
                 uint64_t dstData = data[dst].load(std::memory_order_relaxed);
 
                 // try CAS the neighbor with the new actual distance
@@ -321,14 +328,14 @@ void MQThreadTask(const Vertex* graph, MQ &wl, stat *stats,
             auto& adjNode = graph[src].adj[e];
             uint32_t dst = adjNode.n;
             uint32_t nFScore = fScore + adjNode.d_cm;
-            if (targetDist <= nFScore) continue;
-            uint64_t dstData = data[dst].load(std::memory_order_relaxed);
+            if (targetDist <= nFScore) continue;  // dont check this in vector code (this is not the mask, can & this with the shift mask)
+            uint64_t dstData = data[dst].load(std::memory_order_relaxed); // this is the irreg load, which I am gathering
 
             // try CAS the neighbor with the new actual distance
             bool swapped = false;
             do {
                 uint32_t dstDist = dstData & FSCORE_MASK;
-                if (dstDist <= nFScore) break;
+                if (dstDist <= nFScore) break; // check this in vec, double check that this is the mask I am vectorizing
                 uint64_t srcShift = src;
                 uint64_t swapVal = (srcShift << 32) | nFScore;
                 swapped = data[dst].compare_exchange_weak(
@@ -339,7 +346,7 @@ void MQThreadTask(const Vertex* graph, MQ &wl, stat *stats,
             if (!swapped) continue;
 
             // compute new heuristic of the neighbor
-            uint32_t nGScore = std::max(gScore, nFScore + dist(&graph[dst], &graph[targetNode]));
+            uint32_t nGScore = std::max(gScore, nFScore + dist(&graph[dst], &graph[targetNode])); // this line calls sinusoid (mcj thinks), expensive
             if (targetDist <= nGScore) continue;
 
             // only push if relaxing this vertex is profitable
