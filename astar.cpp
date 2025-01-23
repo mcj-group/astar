@@ -78,6 +78,27 @@ constexpr uint32_t countr_zero(uint32_t x) noexcept {
   return (x) ? ((uint32_t)(__builtin_ctz(x))) : ((uint32_t)(sizeof(uint32_t) * 8));
 }
 #endif
+
+#include <sstream>
+#include <iomanip>
+std::string m256i_to_string(const char* name, __m256i vec, bool printhex=false) {
+    alignas(32) int values[8];
+    _mm256_store_si256(reinterpret_cast<__m256i*>(values), vec);
+
+    std::ostringstream oss;
+    oss << name << ": ";
+    for (int i = 0; i < 8; ++i) {
+        if (printhex) {
+            oss << i << "[0x" << std::setfill('0') << std::setw(8) << std::hex << values[i] << std::dec << "] ";
+        } else {
+            oss << i << "[" << values[i] << "] ";
+        }
+    }
+
+    // Return the resulting string
+    return oss.str();
+}
+
 /* ================================================ */
 
 
@@ -119,6 +140,8 @@ void MQThreadTask(const Vertex* graph, MQ &wl, stat *stats,
         uint64_t srcData = data[src].load(std::memory_order_relaxed);
         uint32_t fScore = srcData & FSCORE_MASK;
 
+        // std::cout << "src " << src << " =========" << std::endl;
+
 #ifdef AWU_MASK_SCALAR // mask opt
         uint32_t eBegin = 0;
         uint32_t eEnd = graph[src].adj.size();
@@ -131,18 +154,21 @@ void MQThreadTask(const Vertex* graph, MQ &wl, stat *stats,
             for (auto f = e; f != std::min(e + B, eEnd); f++) {
                 auto& adjNode = *(adjbase + f);
                 uint32_t nFScore = fScore + adjNode.d_cm;
-                bool cmp = targetDist > nFScore;
-                mask |= cmp << (f - e);
+                bool cmp1 = targetDist > nFScore; // if often dont continue, then high overhead
+
+                uint32_t dst = adjNode.n;
+                uint64_t dstData = data[dst].load(std::memory_order_relaxed); // make sure vec gather preddicate on cmp1
+                uint32_t dstDist = dstData & FSCORE_MASK;
+                bool cmp2 = dstDist > nFScore;
+                mask |= (cmp1 & cmp2) << (f - e);
             }
 
             for (uint32_t i = countr_zero(mask);
                i < B;
                i = countr_zero(mask & (UINT64_MAX << (i + 1)))) {
                 auto& adjNode = *(adjbase + e + i);
-                uint32_t dst = adjNode.n;
                 uint32_t nFScore = fScore + adjNode.d_cm;
-
-                if (targetDist <= nFScore) continue;
+                uint32_t dst = adjNode.n;
                 uint64_t dstData = data[dst].load(std::memory_order_relaxed);
 
                 // try CAS the neighbor with the new actual distance
@@ -160,7 +186,7 @@ void MQThreadTask(const Vertex* graph, MQ &wl, stat *stats,
                 if (!swapped) continue;
 
                 // compute new heuristic of the neighbor
-                uint32_t nGScore = std::max(gScore, nFScore + dist(&graph[dst], &graph[targetNode]));
+                uint32_t nGScore = std::max(gScore, nFScore + dist(&graph[dst], &graph[targetNode])); // delay vectorizing dist
                 if (targetDist <= nGScore) continue;
 
                 // only push if relaxing this vertex is profitable
@@ -172,7 +198,9 @@ void MQThreadTask(const Vertex* graph, MQ &wl, stat *stats,
         uint32_t eEnd = graph[src].adj.size();
         constexpr uint32_t B = 8;   // 4 avx2 instructions long
         const int * adjbase = reinterpret_cast<const int*>(&graph[src].adj[0]);
-        // treat type Adj (64b struct) as {uint32_t, uint32_t} *(note)
+        std::atomic<uint32_t> *database = reinterpret_cast<std::atomic<uint32_t> *>(data);
+        // *(note)
+        // treat type Adj (64b struct) as {uint32_t, uint32_t}
         // auto& adjNode = *(adjbase + f);
         // type Adj is struct {uint32_t n , uint32_t d_cm} @ word 0 and word 1
         // so Adj[i] := uint64_t[i] = uint32_t[2*i] 
@@ -184,31 +212,66 @@ void MQThreadTask(const Vertex* graph, MQ &wl, stat *stats,
         static_assert(sizeof(fScore) == sizeof(uint32_t));
 
         for (uint32_t e = 0; e < eEnd; e += B) {
-#   ifdef AWU_VECSCHEME_ALWAYS // vec scheme
+    #ifdef AWU_VECSCHEME_ALWAYS // vec scheme
             // type Adj is struct {uint32_t n , uint32_t d_cm} @ word 0 and word 1
             // gather a vector of d_cm's, which is every odd indexed uint32_t
+
+            // the gist
+            // mask_i64gather adj_L = Adj[i+0 : i+3] as vec<i64>
+            // mask_i64gather adj_H = Adj[i+4 : i+7] as vec<i64>
+            // cast adj_L and adj_H as vec<i32>
+            // collect ns = {L0, L2, L4, L6, H0, H2, H4, H6}
+            // collect dcms = {L1, L3, L5, L7, H1, H3, H5, H7}
+
             __m256i es = _mm256_set1_epi32(e);  // *(note)
-            __m256i offsets = _mm256_set_epi32(15, 13, 11, 9, 7, 5, 3, 1);
-            __m256i indices = _mm256_add_epi32(es, offsets);
+            const __m256i dcm_offsets = _mm256_set_epi32(15, 13, 11, 9, 7, 5, 3, 1);
+            __m256i dcm_indices = _mm256_add_epi32(es, dcm_offsets);
+            // std::cout << m256i_to_string("dcm_indices", dcm_indices) << std::endl;
 
             uint8_t shift = ((e + B < eEnd) ? 0 : ((e+B) - eEnd));
-            __m256i innermask = shiftToMask256(shift);
+            __m256i innermask = shiftToMask256(shift);  // uses the msb of each i32 element as maskbit
 
-            __m256i dcms = _mm256_mask_i32gather_epi32(_mm256_setzero_si256(), adjbase, indices, innermask, 4);
-
+            __m256i dcms = _mm256_mask_i32gather_epi32(_mm256_setzero_si256(), adjbase, dcm_offsets, innermask, 4);
             __m256i nFScores = _mm256_add_epi32(fScores, dcms);
+            __m256i cmp1s = _mm256_cmpgt_epi32(targetDists, nFScores); // each arg: 1s if new < old, *compares signed ints
+            cmp1s = _mm256_and_si256(cmp1s, innermask); // only care about msb<i32>, set 0 if element is unused
+            // std::cout << m256i_to_string("dcms", dcms) << std::endl;
+            // std::cout << m256i_to_string("targetDists", targetDists) << std::endl;
+            // std::cout << m256i_to_string("nFScores", nFScores) << std::endl;
+            // std::cout << m256i_to_string("cmp1s(msb)", cmp1s, true) << std::endl;
+            
+            const __m256i n_offsets = _mm256_set_epi32(14, 12, 10, 8, 6, 4, 2, 0);
+            __m256i n_indices = _mm256_add_epi32(es, n_offsets);
+            __m256i dsts = _mm256_mask_i32gather_epi32(_mm256_setzero_si256(), adjbase, n_indices, cmp1s, 4);
+            // std::cout << m256i_to_string("n_indices", n_indices) << std::endl;
+            // std::cout << m256i_to_string("dsts", dsts) << std::endl;
 
-            __m256i cmp = _mm256_cmpgt_epi32(targetDists, nFScores); // each arg: 1s if new < old, *compares signed ints
+            // uint64_t dstData from accessing std::atomic<uint64_t> *data
+            // then uint32_t dstDist = dstData & FSCORE_MASK; (only the lower 31 bits (int excl signed bit))
+            // (1) recast data at atomic<32 bit> to get more concurrent accesses
+            // (2) mask again to remove sign bit
+            // (3) vector cmp (dstDist > nFScore) then make mask
+            const __m256i FSCORE_VMASK = _mm256_set1_epi32(FSCORE_MASK);
+            __m256i dstDatas = _mm256_mask_i32gather_epi32(_mm256_setzero_si256(), database, dsts, innermask, 4);
+            __m256i dstDists = _mm256_and_si256(dstDatas, FSCORE_VMASK);
+            __m256i cmp2s = _mm256_cmpgt_epi32(dstDists, nFScores); // *compares signed ints
+            // std::cout << m256i_to_string("dstDists", dstDists) << std::endl;
+            // std::cout << m256i_to_string("cmp2s", cmp2s, true) << std::endl;
+            // HERE TODO
+
+            __m256i cmp = _mm256_and_si256(cmp1s, cmp2s);
+            // std::cout << m256i_to_string("cmp", cmp, true) << std::endl;
+            // std::cout << "\n" << std::endl;
             __m256 cmp_cast = _mm256_castsi256_ps(cmp);           // concat msb of each 32b int
             uint32_t mask_prep = static_cast<uint32_t>(_mm256_movemask_ps(cmp_cast));
             uint32_t mask = mask_prep & static_cast<uint32_t>(0xffu >> shift);
 
-#   elif defined(AWU_VECSCHEME_FILLVEC) // vec scheme
-#       ifdef AWU_MASKWIDTH_64
+    #elif defined(AWU_VECSCHEME_FILLVEC) // vec scheme
+        #ifdef AWU_MASKWIDTH_64
             uint64_t mask = 0;
-#       else
+        #else
             uint32_t mask = 0;
-#       endif
+        #endif
             if (e+B < eEnd) {
                 for (auto f = e; f < e+B; f += 8) {
                     // type Adj is struct {uint32_t n , uint32_t d_cm} @ word 0 and word 1
@@ -224,34 +287,34 @@ void MQThreadTask(const Vertex* graph, MQ &wl, stat *stats,
                     __m256i cmp = _mm256_cmpgt_epi32(targetDists, nFScores); // each arg: 1s if new < old, *compares signed ints
                     __m256 cmp_cast = _mm256_castsi256_ps(cmp);           // concat msb of each 32b int
                     uint8_t shift = ((e + B < eEnd) ? 0 : ((e+B) - eEnd));
-#       ifdef AWU_MASKWIDTH_64
+        #ifdef AWU_MASKWIDTH_64
                     uint64_t mask_prep = static_cast<uint64_t>(_mm256_movemask_ps(cmp_cast));
                     mask |= static_cast<uint64_t>((mask_prep & static_cast<uint64_t>(0xffu >> shift)) << (f - e));
-#       else
+        #else
                     uint32_t mask_prep = static_cast<uint32_t>(_mm256_movemask_ps(cmp_cast));
                     mask |= static_cast<uint32_t>((mask_prep & static_cast<uint32_t>(0xffu >> shift)) << (f - e));
-#       endif
+        #endif
                 }
             } else {
                 for (auto f = e; f != std::min(e + B, eEnd); f++) {
                     const Adj & adjNode = *reinterpret_cast<const Adj*>(adjbase + f);
                     uint32_t nFScore = fScore + adjNode.d_cm;
-#       ifdef AWU_MASKWIDTH_64
+        #ifdef AWU_MASKWIDTH_64
                     uint64_t cmp = static_cast<uint64_t>(targetDist > nFScore);
                     mask |= static_cast<uint64_t>(cmp << (f - e));
-#       else
+        #else
                     uint32_t cmp = static_cast<uint32_t>(targetDist > nFScore);
                     mask |= static_cast<uint32_t>(cmp << (f - e));
-#       endif
+        #endif
                 }
             }
 
-#   elif defined(AWU_VECSCHEME_MOSTOFVEC) // vec scheme
-#       ifdef AWU_MASKWIDTH_64
+    #elif defined(AWU_VECSCHEME_MOSTOFVEC) // vec scheme
+        #ifdef AWU_MASKWIDTH_64
             uint64_t mask = 0;
-#       else
+        #else
             uint32_t mask = 0;
-#       endif
+        #endif
             auto f = e;
             for(; f + 8 < std::min(e + B, eEnd); f += 8) {
                 // type Adj is struct {uint32_t n , uint32_t d_cm} @ word 0 and word 1
@@ -267,38 +330,40 @@ void MQThreadTask(const Vertex* graph, MQ &wl, stat *stats,
                 __m256i cmp = _mm256_cmpgt_epi32(targetDists, nFScores); // each arg: 1s if new < old, *compares signed ints
                 __m256 cmp_cast = _mm256_castsi256_ps(cmp);           // concat msb of each 32b int
                 uint8_t shift = ((e + B < eEnd) ? 0 : ((e+B) - eEnd));
-#       ifdef AWU_MASKWIDTH_64
+        #ifdef AWU_MASKWIDTH_64
                 uint64_t mask_prep = static_cast<uint64_t>(_mm256_movemask_ps(cmp_cast));
                 mask |= static_cast<uint64_t>((mask_prep & static_cast<uint64_t>(0xffu >> shift)) << (f - e));
-#       else
+        #else
                 uint32_t mask_prep = static_cast<uint32_t>(_mm256_movemask_ps(cmp_cast));
                 mask |= static_cast<uint32_t>((mask_prep & static_cast<uint32_t>(0xffu >> shift)) << (f - e));
-#       endif
+        #endif
             }
             for (; f != std::min(e + B, eEnd); f++) {
                 const Adj & adjNode = *reinterpret_cast<const Adj*>(adjbase + f);
                 uint32_t nFScore = fScore + adjNode.d_cm;
-#       ifdef AWU_MASKWIDTH_64
+        #ifdef AWU_MASKWIDTH_64
                 uint64_t cmp = static_cast<uint64_t>(targetDist > nFScore);
                 mask |= static_cast<uint64_t>(cmp << (f - e));
-#       else
+        #else
                 uint32_t cmp = static_cast<uint32_t>(targetDist > nFScore);
                 mask |= static_cast<uint32_t>(cmp << (f - e));
-#       endif
+        #endif
             }
 
-#   endif // vec scheme
+    #endif // vec scheme
             Adj * adjbase = const_cast<Adj *>(reinterpret_cast<const Adj*>(&graph[src].adj[0]));
+            // std::cout << "***\nmask = 0x" << std::setfill('0') << std::setw(8) << std::hex << mask << std::dec << "]\n***" << std::endl;
             for (uint32_t i = countr_zero(mask);
                i < B;
                i = countr_zero(mask & (UINT64_MAX << (i + 1)))) {
                 const Adj & adjNode = *reinterpret_cast<const Adj*>(adjbase + e + i);
                 uint32_t dst = adjNode.n;
-                uint32_t nFScore = fScore + adjNode.d_cm; // does this change from prev loop?
-                                                          // this is fp, might be worth memoizing
 
-                if (targetDist <= nFScore) continue; // if does not change, can remove this cond
-                uint64_t dstData = data[dst].load(std::memory_order_relaxed);
+                // if (targetDist <= nFScore) continue; // if does not change, can remove this cond
+                uint64_t dstData = data[dst].load(std::memory_order_relaxed); // moved up from below computing nFScore
+
+                uint32_t nFScore = fScore + adjNode.d_cm; // does this change from prev loop?
+                                                          // no change in fScore or d_cm
 
                 // try CAS the neighbor with the new actual distance
                 bool swapped = false;
@@ -455,11 +520,14 @@ void astarMQ(Vertex* graph, std::string qType, uint32_t numNodes,
 
     // trace back the path for verification
     uint32_t cur = targetNode;
+    std::cout << "pre-verif targetNode = " << cur << std::endl;
     while (cur != sourceNode) {
         uint32_t parent = data[cur].load(std::memory_order_relaxed) >> 32;
+        std::cout << "verif parent = " << parent << std::endl;
         graph[cur].prev = parent;
         cur = parent;
     }
+    std::cout << "after verif\n" << std::endl;
 
     delete [] data;
 }
