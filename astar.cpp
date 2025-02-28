@@ -146,29 +146,27 @@ void MQThreadTask(const Vertex* graph, MQ &wl, stat *stats,
         uint32_t eBegin = 0;
         uint32_t eEnd = graph[src].adj.size();
         constexpr uint32_t B = 8;   // 4 avx2 instructions long
-        // Adj * adjbase = const_cast<Adj *>(reinterpret_cast<const Adj*>(&graph[src].adj[0]));
+
         const int * adjbase_avx = reinterpret_cast<const int *>(&graph[src].adj[0]);
         Adj *adjbase_scal = const_cast<Adj *>(reinterpret_cast<const Adj*>(&graph[src].adj[0]));
         static_assert(sizeof(graph[src].adj[0]) == sizeof(uint64_t));
 
         const int *database_avx = reinterpret_cast<const int*>(data);
 
-
         for (uint32_t e = 0; e < eEnd; e += B) {
             uint32_t mask = 0;
             for (auto f = e; f != std::min(e + B, eEnd); f++) {
-                // auto& adjNode = *(adjbase + f);
+                // <modded orig ref> auto& adjNode = *(adjbase + f);
                 // type Adj is struct {uint32_t n , uint32_t d_cm} @ word 0 and word 1
                 uint32_t adjNode_n = static_cast<uint32_t>(*(adjbase_avx + f*2));
                 uint32_t adjNode_dcm = static_cast<uint32_t>(*(adjbase_avx + f*2 + 1));
-                // uint32_t nFScore = fScore + adjNode.d_cm;
                 uint32_t nFScore = fScore + adjNode_dcm;
                 bool cmp1 = targetDist > nFScore; // if often dont continue, then high overhead
 
-                // uint32_t dst = adjNode.n;
-                // uint64_t dstData = data[dst].load(std::memory_order_relaxed); // make sure vec gather preddicate on cmp1
-                // uint32_t dstDist = dstData & FSCORE_MASK;
-                // -> equiv to uint32_t data[adjNode.n] & 0x7FFF_FFFF, since we are only extracting the lower 32b of the 64b value
+                // <orig ref> uint32_t dst = adjNode.n;
+                // <orig ref> uint64_t dstData = data[dst].load(std::memory_order_relaxed); // make sure vec gather preddicate on cmp1
+                // <orig ref> uint32_t dstDist = dstData & FSCORE_MASK;
+                // equiv to uint32_t data[adjNode.n] & 0x7FFF_FFFF, since we are only extracting the lower 32b of the 64b value
                 uint32_t dst = adjNode_n;
                 uint32_t dstData = static_cast<uint32_t>(*(database_avx + 2*dst));
                 uint32_t dstDist = dstData & FSCORE_MASK;
@@ -206,7 +204,6 @@ void MQThreadTask(const Vertex* graph, MQ &wl, stat *stats,
                 wl.push(nGScore, dst);
             }
         }
-        // std::cout << std::endl;
 
 #elif defined(AWU_MASK_VECTOR) // mask opt
         uint32_t eBegin = 0;
@@ -215,26 +212,18 @@ void MQThreadTask(const Vertex* graph, MQ &wl, stat *stats,
 
         const int *adjbase_avx = reinterpret_cast<const int*>(&graph[src].adj[0]);
         Adj *adjbase_scal = const_cast<Adj *>(reinterpret_cast<const Adj*>(&graph[src].adj[0]));
-        std::atomic<uint32_t> *database = reinterpret_cast<std::atomic<uint32_t> *>(data);
-        const int *database_avx = reinterpret_cast<const int*>(database);
-        // *(note)
-        // treat type Adj (64b struct) as {uint32_t, uint32_t}
-        // auto& adjNode = *(adjbase + f);
-        // type Adj is struct {uint32_t n , uint32_t d_cm} @ word 0 and word 1
-        // so Adj[i] := uint64_t[i] = uint32_t[2*i] 
         static_assert(sizeof(graph[src].adj[0]) == sizeof(uint64_t));
+        const int *database_avx = reinterpret_cast<const int*>(data);
 
         __m256i targetDists = _mm256_set1_epi32(targetDist);
         static_assert(sizeof(targetDist) == sizeof(uint32_t));
         __m256i fScores = _mm256_set1_epi32(fScore);
         static_assert(sizeof(fScore) == sizeof(uint32_t));
 
-        // type Adj is struct {uint32_t n , uint32_t d_cm} @ word 0 and word 1
+        // *(note) type Adj is struct {uint32_t n , uint32_t d_cm} @ word 0 and word 1
         const __m256i FSCORE_VMASK = _mm256_set1_epi32(FSCORE_MASK);
         const __m256i dcm_offsets = _mm256_set_epi32(15, 13, 11, 9, 7, 5, 3, 1);    // odd word indices
         const __m256i n_offsets = _mm256_set_epi32(14, 12, 10, 8, 6, 4, 2, 0);      // even word indices
-
-        // std::cout << "src[" << src << "] ==========" << std::endl;
 
         for (uint32_t e = 0; e < eEnd; e += B) {
     #ifdef AWU_VECSCHEME_ALWAYS // vec scheme
@@ -376,15 +365,12 @@ void MQThreadTask(const Vertex* graph, MQ &wl, stat *stats,
             }
 
     #endif // vec scheme
-            // this loop is identical to the scalar one, so it is functionally correct
             for (uint32_t i = countr_zero(mask);
                i < B;
                i = countr_zero(mask & (UINT64_MAX << (i + 1)))) {
-                // const Adj & adjNode = *reinterpret_cast<const Adj*>(adjbase_scal + e + i);
                 auto& adjNode = *(adjbase_scal + e + i);
                 uint32_t dst = adjNode.n;
 
-                // if (targetDist <= nFScore) continue; // if does not change, can remove this cond
                 uint64_t dstData = data[dst].load(std::memory_order_relaxed); // moved up from below computing nFScore
 
                 uint32_t nFScore = fScore + adjNode.d_cm; // does this change from prev loop?
@@ -410,10 +396,8 @@ void MQThreadTask(const Vertex* graph, MQ &wl, stat *stats,
 
                 // only push if relaxing this vertex is profitable
                 wl.push(nGScore, dst);
-                // std::cout << "        i[" << i << "] pushed dst[" << dst << "]" << std::endl;
             }
         }
-        // std::cout << std::endl;
 
 #else
         for (uint32_t e = 0; e < graph[src].adj.size(); e++) {
