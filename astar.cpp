@@ -140,10 +140,6 @@ void MQThreadTask(const Vertex* graph, MQ &wl, stat *stats,
 
         uint64_t srcData = data[src].load(std::memory_order_relaxed);
         uint32_t fScore = srcData & FSCORE_MASK;
-        const __m256i FSCORE_VMASK = _mm256_set1_epi32(FSCORE_MASK);
-        const __m256i dcm_offsets = _mm256_set_epi32(15, 13, 11, 9, 7, 5, 3, 1);    // the upper word of struct, of 8 consec nbr
-        const __m256i n_offsets = _mm256_set_epi32(14, 12, 10, 8, 6, 4, 2, 0);      // the lower word of struct, of 8 consec nbr
-
         // std::cout << "src " << src << " =========" << std::endl;
 
 #ifdef AWU_MASK_SCALAR // mask opt
@@ -206,11 +202,12 @@ void MQThreadTask(const Vertex* graph, MQ &wl, stat *stats,
 #elif defined(AWU_MASK_VECTOR) // mask opt
         uint32_t eBegin = 0;
         uint32_t eEnd = graph[src].adj.size();
-        constexpr uint32_t B = 8;   // 4 avx2 instructions long
-        const int * adjbase = reinterpret_cast<const int*>(&graph[src].adj[0]);
-        Adj * adjbase2 = const_cast<Adj *>(reinterpret_cast<const Adj*>(&graph[src].adj[0]));
+        constexpr uint32_t B = 8;   // avx2 256b vectors fit 8x 32b values
+
+        const int *adjbase_avx = reinterpret_cast<const int*>(&graph[src].adj[0]);
+        Adj *adjbase_scal = const_cast<Adj *>(reinterpret_cast<const Adj*>(&graph[src].adj[0]));
         std::atomic<uint32_t> *database = reinterpret_cast<std::atomic<uint32_t> *>(data);
-        const int* idatabase = reinterpret_cast<const int*>(database);
+        const int *database_avx = reinterpret_cast<const int*>(database);
         // *(note)
         // treat type Adj (64b struct) as {uint32_t, uint32_t}
         // auto& adjNode = *(adjbase + f);
@@ -222,6 +219,11 @@ void MQThreadTask(const Vertex* graph, MQ &wl, stat *stats,
         static_assert(sizeof(targetDist) == sizeof(uint32_t));
         __m256i fScores = _mm256_set1_epi32(fScore);
         static_assert(sizeof(fScore) == sizeof(uint32_t));
+
+        // type Adj is struct {uint32_t n , uint32_t d_cm} @ word 0 and word 1
+        const __m256i FSCORE_VMASK = _mm256_set1_epi32(FSCORE_MASK);
+        const __m256i dcm_offsets = _mm256_set_epi32(15, 13, 11, 9, 7, 5, 3, 1);    // odd word indices
+        const __m256i n_offsets = _mm256_set_epi32(14, 12, 10, 8, 6, 4, 2, 0);      // even word indices
 
         // std::cout << "src[" << src << "] ==========" << std::endl;
 
@@ -244,7 +246,7 @@ void MQThreadTask(const Vertex* graph, MQ &wl, stat *stats,
             uint8_t shift = ((e + B < eEnd) ? 0 : ((e+B) - eEnd));
             __m256i innermask = shiftToMask256(shift);  // uses the msb of each i32 element as maskbit
 
-            __m256i dcms = _mm256_mask_i32gather_epi32(_mm256_setzero_si256(), adjbase, dcm_offsets, innermask, 4);
+            __m256i dcms = _mm256_mask_i32gather_epi32(_mm256_setzero_si256(), adjbase_avx, dcm_offsets, innermask, 4);
             __m256i nFScores = _mm256_add_epi32(fScores, dcms);
             __m256i cmp1s = _mm256_cmpgt_epi32(targetDists, nFScores); // each arg: 1s if new < old, *compares signed ints
             cmp1s = _mm256_and_si256(cmp1s, innermask); // only care about msb<i32>, set 0 if element is unused
@@ -254,7 +256,7 @@ void MQThreadTask(const Vertex* graph, MQ &wl, stat *stats,
             // std::cout << "    " << m256i_to_string("cmp1s(msb)", cmp1s, true) << std::endl;
             
             __m256i n_indices = _mm256_add_epi32(es, n_offsets);
-            __m256i dsts = _mm256_mask_i32gather_epi32(_mm256_setzero_si256(), adjbase, n_indices, cmp1s, 4);
+            __m256i dsts = _mm256_mask_i32gather_epi32(_mm256_setzero_si256(), adjbase_avx, n_indices, cmp1s, 4);
             // std::cout << "    " << m256i_to_string("n_indices", n_indices) << std::endl;
             // std::cout << "    " << m256i_to_string("dsts", dsts) << std::endl;
 
@@ -263,7 +265,7 @@ void MQThreadTask(const Vertex* graph, MQ &wl, stat *stats,
             // (1) recast data at atomic<32 bit> to get more concurrent accesses
             // (2) mask again to remove sign bit
             // (3) vector cmp (dstDist > nFScore) then make mask
-            __m256i dstDatas = _mm256_mask_i32gather_epi32(_mm256_setzero_si256(), idatabase, dsts, innermask, 4);
+            __m256i dstDatas = _mm256_mask_i32gather_epi32(_mm256_setzero_si256(), database_avx, dsts, innermask, 4);
             __m256i dstDists = _mm256_and_si256(dstDatas, FSCORE_VMASK);
             __m256i cmp2s = _mm256_cmpgt_epi32(dstDists, nFScores); // *compares signed ints
             // std::cout << "    " << m256i_to_string("dstDists", dstDists) << std::endl;
@@ -369,8 +371,8 @@ void MQThreadTask(const Vertex* graph, MQ &wl, stat *stats,
             for (uint32_t i = countr_zero(mask);
                i < B;
                i = countr_zero(mask & (UINT64_MAX << (i + 1)))) {
-                // const Adj & adjNode = *reinterpret_cast<const Adj*>(adjbase2 + e + i);
-                auto& adjNode = *(adjbase2 + e + i);
+                // const Adj & adjNode = *reinterpret_cast<const Adj*>(adjbase_scal + e + i);
+                auto& adjNode = *(adjbase_scal + e + i);
                 uint32_t dst = adjNode.n;
 
                 // if (targetDist <= nFScore) continue; // if does not change, can remove this cond
