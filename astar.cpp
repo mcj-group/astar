@@ -39,11 +39,11 @@ constexpr static uint64_t FSCORE_MASK = 0x7fffffff; // exclude msb for vector si
 
 /* Knobs */
 /*     Mask Option (default orig) */
-// #define AWU_MASK_SCALAR
-#define AWU_MASK_VECTOR
+#define AWU_MASK_SCALAR
+// #define AWU_MASK_VECTOR
 
 /*     Vectorization Scheme (no default) */
-#define AWU_VECSCHEME_ALWAYS   // vecld: always use vector instructions to construct mask. Use inner mask to not-gather the excess vector elements
+// #define AWU_VECSCHEME_ALWAYS   // vecld: always use vector instructions to construct mask. Use inner mask to not-gather the excess vector elements
 // #define AWU_VECSCHEME_FILLVEC  // dynvec angus: vectorize only if (vertex.remaining_edges >= Bee), fill Bee-wide vector with Bee/(8) loops of vgather, else scalar
 // #define AWU_VECSCHEME_MOSTOFVEC   // dynvec mcj: Bee-bit-wide mask, vectorize (vertex.remaining_edges // (8) ) times, scalar (vertex.remaining_edges % (8) times)
 
@@ -146,20 +146,32 @@ void MQThreadTask(const Vertex* graph, MQ &wl, stat *stats,
         uint32_t eBegin = 0;
         uint32_t eEnd = graph[src].adj.size();
         constexpr uint32_t B = 8;   // 4 avx2 instructions long
-        Adj * adjbase = const_cast<Adj *>(reinterpret_cast<const Adj*>(&graph[src].adj[0]));
+        // Adj * adjbase = const_cast<Adj *>(reinterpret_cast<const Adj*>(&graph[src].adj[0]));
+        const int * adjbase_avx = reinterpret_cast<const int *>(&graph[src].adj[0]);
+        Adj *adjbase_scal = const_cast<Adj *>(reinterpret_cast<const Adj*>(&graph[src].adj[0]));
         static_assert(sizeof(graph[src].adj[0]) == sizeof(uint64_t));
+
+        const int *database_avx = reinterpret_cast<const int*>(data);
 
         // std::cout << "src[" << src << "] ==========" << std::endl;
 
         for (uint32_t e = 0; e < eEnd; e += B) {
             uint32_t mask = 0;
             for (auto f = e; f != std::min(e + B, eEnd); f++) {
-                auto& adjNode = *(adjbase + f);
-                uint32_t nFScore = fScore + adjNode.d_cm;
+                // auto& adjNode = *(adjbase + f);
+                // type Adj is struct {uint32_t n , uint32_t d_cm} @ word 0 and word 1
+                uint32_t adjNode_n = static_cast<uint32_t>(*(adjbase_avx + f*2));
+                uint32_t adjNode_dcm = static_cast<uint32_t>(*(adjbase_avx + f*2 + 1));
+                // uint32_t nFScore = fScore + adjNode.d_cm;
+                uint32_t nFScore = fScore + adjNode_dcm;
                 bool cmp1 = targetDist > nFScore; // if often dont continue, then high overhead
 
-                uint32_t dst = adjNode.n;
-                uint64_t dstData = data[dst].load(std::memory_order_relaxed); // make sure vec gather preddicate on cmp1
+                // uint32_t dst = adjNode.n;
+                // uint64_t dstData = data[dst].load(std::memory_order_relaxed); // make sure vec gather preddicate on cmp1
+                // uint32_t dstDist = dstData & FSCORE_MASK;
+                // -> equiv to uint32_t data[adjNode.n] & 0x7FFF_FFFF, since we are only extracting the lower 32b of the 64b value
+                uint32_t dst = adjNode_n;
+                uint32_t dstData = static_cast<uint32_t>(*(database_avx + 2*dst));
                 uint32_t dstDist = dstData & FSCORE_MASK;
                 bool cmp2 = dstDist > nFScore;
                 mask |= (cmp1 & cmp2) << (f - e);
@@ -169,7 +181,7 @@ void MQThreadTask(const Vertex* graph, MQ &wl, stat *stats,
             for (uint32_t i = countr_zero(mask);
                i < B;
                i = countr_zero(mask & (UINT64_MAX << (i + 1)))) {
-                auto& adjNode = *(adjbase + e + i);
+                auto& adjNode = *(adjbase_scal + e + i);
                 uint32_t nFScore = fScore + adjNode.d_cm;
                 uint32_t dst = adjNode.n;
                 uint64_t dstData = data[dst].load(std::memory_order_relaxed);
