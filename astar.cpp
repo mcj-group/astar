@@ -370,11 +370,8 @@ void MQThreadTask(const Vertex* graph, MQ &wl, stat *stats,
                i = countr_zero(mask & (UINT64_MAX << (i + 1)))) {
                 auto& adjNode = *(adjbase_scal + e + i);
                 uint32_t dst = adjNode.n;
-
                 uint64_t dstData = data[dst].load(std::memory_order_relaxed); // moved up from below computing nFScore
-
-                uint32_t nFScore = fScore + adjNode.d_cm; // does this change from prev loop?
-                                                          // no change in fScore or d_cm
+                uint32_t nFScore = fScore + adjNode.d_cm; // does not change from prev loop
 
                 // try CAS the neighbor with the new actual distance
                 bool swapped = false;
