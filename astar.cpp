@@ -32,6 +32,7 @@
  */
 
 constexpr static uint64_t FSCORE_MASK = 0x7fffffff; // exclude msb for vector signed compares, to prevent wraparound negatives
+                                                    // for germany.bin, no vertex has (uint32_t dstData)[31] (MSB) set, so this is okay
 
 /* Vector stuff ================================== */
 #include <immintrin.h>
@@ -139,6 +140,9 @@ void MQThreadTask(const Vertex* graph, MQ &wl, stat *stats,
 
         uint64_t srcData = data[src].load(std::memory_order_relaxed);
         uint32_t fScore = srcData & FSCORE_MASK;
+        const __m256i FSCORE_VMASK = _mm256_set1_epi32(FSCORE_MASK);
+        const __m256i dcm_offsets = _mm256_set_epi32(15, 13, 11, 9, 7, 5, 3, 1);    // the upper word of struct, of 8 consec nbr
+        const __m256i n_offsets = _mm256_set_epi32(14, 12, 10, 8, 6, 4, 2, 0);      // the lower word of struct, of 8 consec nbr
 
         // std::cout << "src " << src << " =========" << std::endl;
 
@@ -148,6 +152,8 @@ void MQThreadTask(const Vertex* graph, MQ &wl, stat *stats,
         constexpr uint32_t B = 8;   // 4 avx2 instructions long
         Adj * adjbase = const_cast<Adj *>(reinterpret_cast<const Adj*>(&graph[src].adj[0]));
         static_assert(sizeof(graph[src].adj[0]) == sizeof(uint64_t));
+
+        // std::cout << "src[" << src << "] ==========" << std::endl;
 
         for (uint32_t e = 0; e < eEnd; e += B) {
             uint32_t mask = 0;
@@ -162,6 +168,7 @@ void MQThreadTask(const Vertex* graph, MQ &wl, stat *stats,
                 bool cmp2 = dstDist > nFScore;
                 mask |= (cmp1 & cmp2) << (f - e);
             }
+            // std::cout << "    mask[0x" << std::setfill('0') << std::setw(8) << std::hex << mask << std::dec << "]" << std::endl;
 
             for (uint32_t i = countr_zero(mask);
                i < B;
@@ -191,14 +198,19 @@ void MQThreadTask(const Vertex* graph, MQ &wl, stat *stats,
 
                 // only push if relaxing this vertex is profitable
                 wl.push(nGScore, dst);
+                // std::cout << "        i[" << i << "] pushed dst[" << dst << "]" << std::endl;
             }
         }
+        // std::cout << std::endl;
+
 #elif defined(AWU_MASK_VECTOR) // mask opt
         uint32_t eBegin = 0;
         uint32_t eEnd = graph[src].adj.size();
         constexpr uint32_t B = 8;   // 4 avx2 instructions long
         const int * adjbase = reinterpret_cast<const int*>(&graph[src].adj[0]);
+        Adj * adjbase2 = const_cast<Adj *>(reinterpret_cast<const Adj*>(&graph[src].adj[0]));
         std::atomic<uint32_t> *database = reinterpret_cast<std::atomic<uint32_t> *>(data);
+        const int* idatabase = reinterpret_cast<const int*>(database);
         // *(note)
         // treat type Adj (64b struct) as {uint32_t, uint32_t}
         // auto& adjNode = *(adjbase + f);
@@ -210,6 +222,8 @@ void MQThreadTask(const Vertex* graph, MQ &wl, stat *stats,
         static_assert(sizeof(targetDist) == sizeof(uint32_t));
         __m256i fScores = _mm256_set1_epi32(fScore);
         static_assert(sizeof(fScore) == sizeof(uint32_t));
+
+        // std::cout << "src[" << src << "] ==========" << std::endl;
 
         for (uint32_t e = 0; e < eEnd; e += B) {
     #ifdef AWU_VECSCHEME_ALWAYS // vec scheme
@@ -223,8 +237,7 @@ void MQThreadTask(const Vertex* graph, MQ &wl, stat *stats,
             // collect ns = {L0, L2, L4, L6, H0, H2, H4, H6}
             // collect dcms = {L1, L3, L5, L7, H1, H3, H5, H7}
 
-            __m256i es = _mm256_set1_epi32(e);  // *(note)
-            const __m256i dcm_offsets = _mm256_set_epi32(15, 13, 11, 9, 7, 5, 3, 1);
+            __m256i es = _mm256_set1_epi32(e*2);  // *(note), each element is 2*uint32_t
             __m256i dcm_indices = _mm256_add_epi32(es, dcm_offsets);
             // std::cout << m256i_to_string("dcm_indices", dcm_indices) << std::endl;
 
@@ -235,32 +248,30 @@ void MQThreadTask(const Vertex* graph, MQ &wl, stat *stats,
             __m256i nFScores = _mm256_add_epi32(fScores, dcms);
             __m256i cmp1s = _mm256_cmpgt_epi32(targetDists, nFScores); // each arg: 1s if new < old, *compares signed ints
             cmp1s = _mm256_and_si256(cmp1s, innermask); // only care about msb<i32>, set 0 if element is unused
-            // std::cout << m256i_to_string("dcms", dcms) << std::endl;
-            // std::cout << m256i_to_string("targetDists", targetDists) << std::endl;
-            // std::cout << m256i_to_string("nFScores", nFScores) << std::endl;
-            // std::cout << m256i_to_string("cmp1s(msb)", cmp1s, true) << std::endl;
+            // std::cout << "    " << m256i_to_string("dcms", dcms) << std::endl;
+            // std::cout << "    " << m256i_to_string("targetDists", targetDists) << std::endl;
+            // std::cout << "    " << m256i_to_string("nFScores", nFScores) << std::endl;
+            // std::cout << "    " << m256i_to_string("cmp1s(msb)", cmp1s, true) << std::endl;
             
-            const __m256i n_offsets = _mm256_set_epi32(14, 12, 10, 8, 6, 4, 2, 0);
             __m256i n_indices = _mm256_add_epi32(es, n_offsets);
             __m256i dsts = _mm256_mask_i32gather_epi32(_mm256_setzero_si256(), adjbase, n_indices, cmp1s, 4);
-            // std::cout << m256i_to_string("n_indices", n_indices) << std::endl;
-            // std::cout << m256i_to_string("dsts", dsts) << std::endl;
+            // std::cout << "    " << m256i_to_string("n_indices", n_indices) << std::endl;
+            // std::cout << "    " << m256i_to_string("dsts", dsts) << std::endl;
 
             // uint64_t dstData from accessing std::atomic<uint64_t> *data
             // then uint32_t dstDist = dstData & FSCORE_MASK; (only the lower 31 bits (int excl signed bit))
             // (1) recast data at atomic<32 bit> to get more concurrent accesses
             // (2) mask again to remove sign bit
             // (3) vector cmp (dstDist > nFScore) then make mask
-            const __m256i FSCORE_VMASK = _mm256_set1_epi32(FSCORE_MASK);
-            __m256i dstDatas = _mm256_mask_i32gather_epi32(_mm256_setzero_si256(), database, dsts, innermask, 4);
+            __m256i dstDatas = _mm256_mask_i32gather_epi32(_mm256_setzero_si256(), idatabase, dsts, innermask, 4);
             __m256i dstDists = _mm256_and_si256(dstDatas, FSCORE_VMASK);
             __m256i cmp2s = _mm256_cmpgt_epi32(dstDists, nFScores); // *compares signed ints
-            // std::cout << m256i_to_string("dstDists", dstDists) << std::endl;
-            // std::cout << m256i_to_string("cmp2s", cmp2s, true) << std::endl;
+            // std::cout << "    " << m256i_to_string("dstDists", dstDists) << std::endl;
+            // std::cout << "    " << m256i_to_string("cmp2s", cmp2s, true) << std::endl;
             // HERE TODO
 
             __m256i cmp = _mm256_and_si256(cmp1s, cmp2s);
-            // std::cout << m256i_to_string("cmp", cmp, true) << std::endl;
+            // std::cout << "    " << m256i_to_string("cmp", cmp, true) << std::endl;
             // std::cout << "\n" << std::endl;
             __m256 cmp_cast = _mm256_castsi256_ps(cmp);           // concat msb of each 32b int
             uint32_t mask_prep = static_cast<uint32_t>(_mm256_movemask_ps(cmp_cast));
@@ -351,12 +362,15 @@ void MQThreadTask(const Vertex* graph, MQ &wl, stat *stats,
             }
 
     #endif // vec scheme
-            Adj * adjbase = const_cast<Adj *>(reinterpret_cast<const Adj*>(&graph[src].adj[0]));
-            // std::cout << "***\nmask = 0x" << std::setfill('0') << std::setw(8) << std::hex << mask << std::dec << "]\n***" << std::endl;
+            // Adj * adjbase = const_cast<Adj *>(reinterpret_cast<const Adj*>(&graph[src].adj[0]));
+            // std::cout << "    mask[0x" << std::setfill('0') << std::setw(8) << std::hex << mask << std::dec << "]\n" << std::endl;
+
+            // this loop is identical to the scalar one, so it is functionally correct
             for (uint32_t i = countr_zero(mask);
                i < B;
                i = countr_zero(mask & (UINT64_MAX << (i + 1)))) {
-                const Adj & adjNode = *reinterpret_cast<const Adj*>(adjbase + e + i);
+                // const Adj & adjNode = *reinterpret_cast<const Adj*>(adjbase2 + e + i);
+                auto& adjNode = *(adjbase2 + e + i);
                 uint32_t dst = adjNode.n;
 
                 // if (targetDist <= nFScore) continue; // if does not change, can remove this cond
@@ -369,7 +383,7 @@ void MQThreadTask(const Vertex* graph, MQ &wl, stat *stats,
                 bool swapped = false;
                 do {
                     uint32_t dstDist = dstData & FSCORE_MASK;
-                    if (dstDist <= nFScore) break;
+                    if (dstDist <= nFScore) break;          // this should never be taken, since it was checked above
                     uint64_t srcShift = src;
                     uint64_t swapVal = (srcShift << 32) | nFScore;
                     swapped = data[dst].compare_exchange_weak(
@@ -385,8 +399,10 @@ void MQThreadTask(const Vertex* graph, MQ &wl, stat *stats,
 
                 // only push if relaxing this vertex is profitable
                 wl.push(nGScore, dst);
+                // std::cout << "        i[" << i << "] pushed dst[" << dst << "]" << std::endl;
             }
         }
+        // std::cout << std::endl;
 
 #else
         for (uint32_t e = 0; e < graph[src].adj.size(); e++) {
@@ -520,14 +536,14 @@ void astarMQ(Vertex* graph, std::string qType, uint32_t numNodes,
 
     // trace back the path for verification
     uint32_t cur = targetNode;
-    std::cout << "pre-verif targetNode = " << cur << std::endl;
+    // std::cout << "pre-verif targetNode = " << cur << std::endl;
     while (cur != sourceNode) {
         uint32_t parent = data[cur].load(std::memory_order_relaxed) >> 32;
-        std::cout << "verif parent = " << parent << std::endl;
+        // std::cout << "verif parent = " << parent << std::endl;
         graph[cur].prev = parent;
         cur = parent;
     }
-    std::cout << "after verif\n" << std::endl;
+    // std::cout << "after verif\n" << std::endl;
 
     delete [] data;
 }
