@@ -268,8 +268,8 @@ void MQThreadTask(const Vertex* graph, MQ &wl, stat *stats,
             // Adj := { d_cm (hi), n (lo) } := {X1, X0}
             // vLoad the first 8 Adj obj's into lo, and the next 8 into hi
             //   H1 H0 G1 G0 F1 F0 E1 E0 | D1 D0 C1 C0 B1 B0 A1 A0
-            __m256i adj_lo = _mm256_load_si256(adjbase_avxm);
-            __m256i adj_hi = _mm256_load_si256(adjbase_avxm + 1);
+            __m256i adj_lo = _mm256_loadu_si256(adjbase_avxm);
+            __m256i adj_hi = _mm256_loadu_si256(adjbase_avxm + 1);
             
             // Permute the n's into lower elems, and d_cm's into upper elems
             //   H1 G1 F1 E1 H0 G0 F0 E0 | D1 C1 B1 A1 D0 C0 B0 A0
