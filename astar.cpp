@@ -336,8 +336,8 @@ void MQThreadTask(const Vertex* graph, MQ &wl, stat *stats,
                     __m256i cmp2s = _mm256_cmpgt_epi32(dstDists, nFScores); // *compares signed ints
 
             #else
-                    __m256i adj_lo = _mm256_load_si256(adjbase_avxm);
-                    __m256i adj_hi = _mm256_load_si256(adjbase_avxm + 1);
+                    __m256i adj_lo = _mm256_loadu_si256(adjbase_avxm);
+                    __m256i adj_hi = _mm256_loadu_si256(adjbase_avxm + 1);
 
                     __m256i perm_lo = _mm256_permutevar8x32_epi32(adj_lo, permute_mask);
                     __m256i perm_hi = _mm256_permutevar8x32_epi32(adj_lo, permute_mask);
@@ -413,8 +413,8 @@ void MQThreadTask(const Vertex* graph, MQ &wl, stat *stats,
                 __m256i cmp2s = _mm256_cmpgt_epi32(dstDists, nFScores); // *compares signed ints
 
             #else
-                __m256i adj_lo = _mm256_load_si256(adjbase_avxm);
-                __m256i adj_hi = _mm256_load_si256(adjbase_avxm + 1);
+                __m256i adj_lo = _mm256_loadu_si256(adjbase_avxm);
+                __m256i adj_hi = _mm256_loadu_si256(adjbase_avxm + 1);
 
                 __m256i perm_lo = _mm256_permutevar8x32_epi32(adj_lo, permute_mask);
                 __m256i perm_hi = _mm256_permutevar8x32_epi32(adj_lo, permute_mask);
