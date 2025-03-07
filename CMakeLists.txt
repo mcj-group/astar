@@ -1,4 +1,6 @@
 cmake_minimum_required(VERSION 3.10)
+set(CMAKE_C_COMPILER "/usr/bin/clang")
+set(CMAKE_CXX_COMPILER "/usr/bin/clang++")
 set(CMAKE_TRY_COMPILE_TARGET_TYPE "STATIC_LIBRARY")
 project(astar)
 
@@ -18,6 +20,7 @@ target_compile_options(astar-scal PUBLIC "-mavx2")
 target_compile_definitions(astar-scal PUBLIC AWU_MASK_SCALAR)
 target_link_libraries(astar-scal pthread ${Boost_LIBRARIES})
 
+# vector - load
 add_executable(astar-valways "astar.cpp" "util.h")
 target_compile_options(astar-valways PUBLIC "-mavx2")
 target_compile_definitions(astar-valways PUBLIC AWU_MASK_VECTOR AWU_VECSCHEME_ALWAYS)
@@ -42,6 +45,32 @@ add_executable(astar-vmov64 "astar.cpp" "util.h")
 target_compile_options(astar-vmov64 PUBLIC "-mavx2")
 target_compile_definitions(astar-vmov64 PUBLIC AWU_MASK_VECTOR AWU_VECSCHEME_MOSTOFVEC AWU_MASKWIDTH_64)
 target_link_libraries(astar-vmov64 pthread ${Boost_LIBRARIES})
+
+# vector - gather
+add_executable(astar-valways-gather "astar.cpp" "util.h")
+target_compile_options(astar-valways-gather PUBLIC "-mavx2")
+target_compile_definitions(astar-valways-gather PUBLIC AWU_MASK_VECTOR AWU_VECSCHEME_ALWAYS AWU_VEC_GATHER)
+target_link_libraries(astar-valways-gather pthread ${Boost_LIBRARIES})
+
+add_executable(astar-vvecfill32-gather "astar.cpp" "util.h")
+target_compile_options(astar-vvecfill32-gather PUBLIC "-mavx2")
+target_compile_definitions(astar-vvecfill32-gather PUBLIC AWU_MASK_VECTOR AWU_VECSCHEME_FILLVEC AWU_VEC_GATHER)
+target_link_libraries(astar-vvecfill32-gather pthread ${Boost_LIBRARIES})
+
+add_executable(astar-vvecfill64-gather "astar.cpp" "util.h")
+target_compile_options(astar-vvecfill64-gather PUBLIC "-mavx2")
+target_compile_definitions(astar-vvecfill64-gather PUBLIC AWU_MASK_VECTOR AWU_VECSCHEME_FILLVEC AWU_MASKWIDTH_64 AWU_VEC_GATHER)
+target_link_libraries(astar-vvecfill64-gather pthread ${Boost_LIBRARIES})
+
+add_executable(astar-vmov32-gather "astar.cpp" "util.h")
+target_compile_options(astar-vmov32-gather PUBLIC "-mavx2")
+target_compile_definitions(astar-vmov32-gather PUBLIC AWU_MASK_VECTOR AWU_VECSCHEME_MOSTOFVEC AWU_VEC_GATHER)
+target_link_libraries(astar-vmov32-gather pthread ${Boost_LIBRARIES})
+
+add_executable(astar-vmov64-gather "astar.cpp" "util.h")
+target_compile_options(astar-vmov64-gather PUBLIC "-mavx2")
+target_compile_definitions(astar-vmov64-gather PUBLIC AWU_MASK_VECTOR AWU_VECSCHEME_MOSTOFVEC AWU_MASKWIDTH_64 AWU_VEC_GATHER)
+target_link_libraries(astar-vmov64-gather pthread ${Boost_LIBRARIES})
 
 # # Define the gcov target
 # add_custom_target(gcov
