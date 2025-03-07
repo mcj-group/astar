@@ -274,7 +274,7 @@ void MQThreadTask(const Vertex* graph, MQ &wl, stat *stats,
             // Permute the n's into lower elems, and d_cm's into upper elems
             //   H1 G1 F1 E1 H0 G0 F0 E0 | D1 C1 B1 A1 D0 C0 B0 A0
             __m256i perm_lo = _mm256_permutevar8x32_epi32(adj_lo, permute_mask);
-            __m256i perm_hi = _mm256_permutevar8x32_epi32(adj_lo, permute_mask);
+            __m256i perm_hi = _mm256_permutevar8x32_epi32(adj_hi, permute_mask);
             
             // Swap (lower half of hi) with (upper half of lo)
             //   H1 G1 F1 E1 D1 C1 B1 A1 | H0 G0 F0 E0 D0 C0 B0 A0
