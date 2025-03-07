@@ -50,6 +50,9 @@ constexpr static uint64_t FSCORE_MASK = 0x7fffffff; // exclude msb for vector si
 /*     Mask Width (default 32) (does not affect AWU_VECSCHEME_ALWAYS) */
 // #define AWU_MASKWIDTH_64
 
+/*     Gather vs packed load */
+// #define AWU_VEC_GATHER
+
 #ifdef AWU_MASKWIDTH_64
 constexpr uint32_t B = 64;   // 8 avx2 instructions long: avx2: 256b / uint32_t = (8)
 constexpr __uint128_t UINT128_MAX =__uint128_t(__int128_t(-1L));
@@ -211,6 +214,7 @@ void MQThreadTask(const Vertex* graph, MQ &wl, stat *stats,
         constexpr uint32_t B = 8;   // avx2 256b vectors fit 8x 32b values
 
         const int *adjbase_avx = reinterpret_cast<const int*>(&graph[src].adj[0]);
+        const __m256i *adjbase_avxm = reinterpret_cast<const __m256i *>(&graph[src].adj[0]);
         Adj *adjbase_scal = const_cast<Adj *>(reinterpret_cast<const Adj*>(&graph[src].adj[0]));
         static_assert(sizeof(graph[src].adj[0]) == sizeof(uint64_t));
         const int *database_avx = reinterpret_cast<const int*>(data);
@@ -222,11 +226,17 @@ void MQThreadTask(const Vertex* graph, MQ &wl, stat *stats,
 
         // *(note) type Adj is struct {uint32_t n , uint32_t d_cm} @ word 0 and word 1
         const __m256i FSCORE_VMASK = _mm256_set1_epi32(FSCORE_MASK);
+        // #ifdef AWU_VEC_GATHER
         const __m256i dcm_offsets = _mm256_set_epi32(15, 13, 11, 9, 7, 5, 3, 1);    // odd word indices
         const __m256i n_offsets = _mm256_set_epi32(14, 12, 10, 8, 6, 4, 2, 0);      // even word indices
+        // #else
+        const __m256i permute_mask = _mm256_set_epi32(7, 5, 3, 1, 6, 4, 2, 0);
+        // #endif
 
         for (uint32_t e = 0; e < eEnd; e += B) {
     #ifdef AWU_VECSCHEME_ALWAYS // vec scheme
+        #ifdef AWU_VEC_GATHER
+            // ========= Impl 1: staggered gather =============
             // <scalar ref> uint32_t adjNode_dcm = static_cast<uint32_t>(*(adjbase_avx + f*2 + 1));
             // <scalar ref> uint32_t nFScore = fScore + adjNode_dcm;
             // <scalar ref> bool cmp1 = targetDist > nFScore;
@@ -252,6 +262,43 @@ void MQThreadTask(const Vertex* graph, MQ &wl, stat *stats,
             __m256i dstDatas = _mm256_mask_i32gather_epi32(_mm256_setzero_si256(), database_avx, twoxdsts, cmp1s, 4);
             __m256i dstDists = _mm256_and_si256(dstDatas, FSCORE_VMASK);
             __m256i cmp2s = _mm256_cmpgt_epi32(dstDists, nFScores); // *compares signed ints
+
+        #else
+            // ========== Impl 2: Packed load and Permute ========
+            // Adj := { d_cm (hi), n (lo) } := {X1, X0}
+            // vLoad the first 8 Adj obj's into lo, and the next 8 into hi
+            //   H1 H0 G1 G0 F1 F0 E1 E0 | D1 D0 C1 C0 B1 B0 A1 A0
+            __m256i adj_lo = _mm256_loadu_si256(adjbase_avxm);
+            __m256i adj_hi = _mm256_loadu_si256(adjbase_avxm + 1);
+            
+            // Permute the n's into lower elems, and d_cm's into upper elems
+            //   H1 G1 F1 E1 H0 G0 F0 E0 | D1 C1 B1 A1 D0 C0 B0 A0
+            __m256i perm_lo = _mm256_permutevar8x32_epi32(adj_lo, permute_mask);
+            __m256i perm_hi = _mm256_permutevar8x32_epi32(adj_lo, permute_mask);
+            
+            // Swap (lower half of hi) with (upper half of lo)
+            //   H1 G1 F1 E1 D1 C1 B1 A1 | H0 G0 F0 E0 D0 C0 B0 A0
+            __m128i dcms_lo = _mm256_extracti128_si256(perm_lo, 1);
+            __m128i ns_hi = _mm256_extracti128_si256(perm_hi, 0);
+            __m256i dsts = _mm256_inserti128_si256(perm_lo, ns_hi, 1);      // Adj.n's
+            __m256i dcms = _mm256_inserti128_si256(perm_hi, dcms_lo, 0);    // Adj.d_cm's
+            
+            // <scalar ref> uint32_t nFScore = fScore + adjNode_dcm;
+            // <scalar ref> bool cmp1 = targetDist > nFScore;
+            uint8_t shift = ((e + B < eEnd) ? 0 : ((e+B) - eEnd));
+            __m256i innermask = shiftToMask256(shift);  // uses the msb of each i32 element as maskbit
+            __m256i nFScores = _mm256_add_epi32(fScores, dcms);
+            __m256i cmp1s = _mm256_cmpgt_epi32(targetDists, nFScores); // each arg: 1s if new < old, *compares signed ints
+            cmp1s = _mm256_and_si256(cmp1s, innermask); // only care about msb<i32>, set 0 if element is unused
+
+            // <scalar ref> uint32_t dstData = static_cast<uint32_t>(*(database_avx + 2*dst));
+            // <scalar ref> uint32_t dstDist = dstData & FSCORE_MASK;
+            // <scalar ref> bool cmp2 = dstDist > nFScore;
+            __m256i twoxdsts = _mm256_add_epi32(dsts, dsts);
+            __m256i dstDatas = _mm256_mask_i32gather_epi32(_mm256_setzero_si256(), database_avx, twoxdsts, cmp1s, 4);
+            __m256i dstDists = _mm256_and_si256(dstDatas, FSCORE_VMASK);
+            __m256i cmp2s = _mm256_cmpgt_epi32(dstDists, nFScores); // *compares signed ints
+        #endif // AWU_VEC_GATHER
 
             __m256i cmp = _mm256_and_si256(cmp1s, cmp2s);
             __m256 cmp_cast = _mm256_castsi256_ps(cmp);           // concat msb of each 32b int
@@ -666,6 +713,11 @@ int main(int argc, const char** argv) {
     std::cout << " MaskWidth-64b";
 #   else
     std::cout << " MaskWidth-Default32b";
+#   endif
+#   ifdef AWU_VEC_GATHER
+    std::cout << " Gather";
+#   else
+    std::cout << " Load";
 #   endif
 #else
     std::cout << " Orig";
