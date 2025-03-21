@@ -48,6 +48,17 @@ target_compile_options(astar-vmov64 PUBLIC "-mavx2")
 target_compile_definitions(astar-vmov64 PUBLIC AWU_MASK_VECTOR AWU_VECSCHEME_MOSTOFVEC AWU_MASKWIDTH_64)
 target_link_libraries(astar-vmov64 pthread ${Boost_LIBRARIES})
 
+add_executable(astar-maskedlast32 "astar.cpp" "util.h")
+target_compile_options(astar-maskedlast32 PUBLIC "-mavx2")
+target_compile_definitions(astar-maskedlast32 PUBLIC AWU_MASK_VECTOR AWU_VECSCHEME_MASKEDLAST)
+target_link_libraries(astar-maskedlast32 pthread ${Boost_LIBRARIES})
+
+add_executable(astar-maskedlast64 "astar.cpp" "util.h")
+target_compile_options(astar-maskedlast64 PUBLIC "-mavx2")
+target_compile_definitions(astar-maskedlast64 PUBLIC AWU_MASK_VECTOR AWU_VECSCHEME_MASKEDLAST AWU_MASKWIDTH_64)
+target_link_libraries(astar-maskedlast64 pthread ${Boost_LIBRARIES})
+
+
 # vector - gather
 add_executable(astar-valways-gather "astar.cpp" "util.h")
 target_compile_options(astar-valways-gather PUBLIC "-mavx2")
@@ -73,6 +84,16 @@ add_executable(astar-vmov64-gather "astar.cpp" "util.h")
 target_compile_options(astar-vmov64-gather PUBLIC "-mavx2")
 target_compile_definitions(astar-vmov64-gather PUBLIC AWU_MASK_VECTOR AWU_VECSCHEME_MOSTOFVEC AWU_MASKWIDTH_64 AWU_VEC_GATHER)
 target_link_libraries(astar-vmov64-gather pthread ${Boost_LIBRARIES})
+
+add_executable(astar-maskedlast32-gather "astar.cpp" "util.h")
+target_compile_options(astar-maskedlast32-gather PUBLIC "-mavx2")
+target_compile_definitions(astar-maskedlast32-gather PUBLIC AWU_MASK_VECTOR AWU_VECSCHEME_MASKEDLAST AWU_VEC_GATHER)
+target_link_libraries(astar-maskedlast32-gather pthread ${Boost_LIBRARIES})
+
+add_executable(astar-maskedlast64-gather "astar.cpp" "util.h")
+target_compile_options(astar-maskedlast64-gather PUBLIC "-mavx2")
+target_compile_definitions(astar-maskedlast64-gather PUBLIC AWU_MASK_VECTOR AWU_VECSCHEME_MASKEDLAST AWU_MASKWIDTH_64 AWU_VEC_GATHER)
+target_link_libraries(astar-maskedlast64-gather pthread ${Boost_LIBRARIES})
 
 # # Define the gcov target
 # add_custom_target(gcov

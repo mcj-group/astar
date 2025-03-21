@@ -46,6 +46,7 @@ constexpr static uint64_t FSCORE_MASK = 0x7fffffff; // exclude msb for vector si
 // #define AWU_VECSCHEME_ALWAYS   // vecld: always use vector instructions to construct mask. Use inner mask to not-gather the excess vector elements
 // #define AWU_VECSCHEME_FILLVEC  // dynvec angus: vectorize only if (vertex.remaining_edges >= Bee), fill Bee-wide vector with Bee/(8) loops of vgather, else scalar
 // #define AWU_VECSCHEME_MOSTOFVEC   // dynvec mcj: Bee-bit-wide mask, vectorize (vertex.remaining_edges // (8) ) times, scalar (vertex.remaining_edges % (8) times)
+// #define AWU_VECSCHEME_MASKEDLAST   // Final: Vectorize if vector width can be filled, otherwise use masked gather
 
 /*     Mask Width (default 32) (does not affect AWU_VECSCHEME_ALWAYS) */
 // #define AWU_MASKWIDTH_64
@@ -456,6 +457,127 @@ void MQThreadTask(const Vertex* graph, MQ &wl, stat *stats,
         #endif
             }
 
+    #elif defined(AWU_VECSCHEME_MASKEDLAST) // vec scheme
+        #ifdef AWU_MASKWIDTH_64
+            uint64_t mask = 0;
+        #else
+            uint32_t mask = 0;
+        #endif
+            auto f = e;
+            for(; f + 8 < std::min(e + B, eEnd); f += 8) {
+
+            #ifdef AWU_VEC_GATHER
+                // <scalar ref> uint32_t adjNode_dcm = static_cast<uint32_t>(*(adjbase_avx + f*2 + 1));
+                // <scalar ref> uint32_t nFScore = fScore + adjNode_dcm;
+                // <scalar ref> bool cmp1 = targetDist > nFScore;
+                __m256i fs = _mm256_set1_epi32(f*2);  // *(note), each element is 2*uint32_t
+                __m256i dcm_indices = _mm256_add_epi32(fs, dcm_offsets);
+                __m256i dcms = _mm256_mask_i32gather_epi32(_mm256_setzero_si256(), adjbase_avx, dcm_indices, _mm256_set1_epi64x(-1), 4);
+                __m256i nFScores = _mm256_add_epi32(fScores, dcms);
+                __m256i cmp1s = _mm256_cmpgt_epi32(targetDists, nFScores); // each arg: 1s if new < old, *compares signed ints
+
+                // <scalar ref> uint32_t adjNode_n = static_cast<uint32_t>(*(adjbase_avx + f*2));
+                // <scalar ref> uint32_t dst = adjNode_n;
+                // <scalar ref> uint32_t dstData = static_cast<uint32_t>(*(database_avx + 2*dst));
+                // <scalar ref> uint32_t dstDist = dstData & FSCORE_MASK;
+                // <scalar ref> bool cmp2 = dstDist > nFScore;
+                __m256i n_indices = _mm256_add_epi32(fs, n_offsets);
+                __m256i dsts = _mm256_mask_i32gather_epi32(_mm256_setzero_si256(), adjbase_avx, n_indices, cmp1s, 4);
+                __m256i twoxdsts = _mm256_add_epi32(dsts, dsts);
+                __m256i dstDatas = _mm256_mask_i32gather_epi32(_mm256_setzero_si256(), database_avx, twoxdsts, cmp1s, 4);
+                __m256i dstDists = _mm256_and_si256(dstDatas, FSCORE_VMASK);
+                __m256i cmp2s = _mm256_cmpgt_epi32(dstDists, nFScores); // *compares signed ints
+
+            #else
+                __m256i adj_lo = _mm256_loadu_si256(adjbase_avxm);
+                __m256i adj_hi = _mm256_loadu_si256(adjbase_avxm + 1);
+
+                __m256i perm_lo = _mm256_permutevar8x32_epi32(adj_lo, permute_mask);
+                __m256i perm_hi = _mm256_permutevar8x32_epi32(adj_lo, permute_mask);
+                
+                __m128i dcms_lo = _mm256_extracti128_si256(perm_lo, 1);
+                __m128i ns_hi = _mm256_extracti128_si256(perm_hi, 0);
+                __m256i dsts = _mm256_inserti128_si256(perm_lo, ns_hi, 1);      // Adj.n's
+                __m256i dcms = _mm256_inserti128_si256(perm_hi, dcms_lo, 0);    // Adj.d_cm's
+
+                __m256i nFScores = _mm256_add_epi32(fScores, dcms);
+                __m256i cmp1s = _mm256_cmpgt_epi32(targetDists, nFScores); // each arg: 1s if new < old, *compares signed ints
+
+                __m256i twoxdsts = _mm256_add_epi32(dsts, dsts);
+                __m256i dstDatas = _mm256_mask_i32gather_epi32(_mm256_setzero_si256(), database_avx, twoxdsts, cmp1s, 4);
+                __m256i dstDists = _mm256_and_si256(dstDatas, FSCORE_VMASK);
+                __m256i cmp2s = _mm256_cmpgt_epi32(dstDists, nFScores); // *compares signed ints
+            
+            #endif
+                __m256i cmp = _mm256_and_si256(cmp1s, cmp2s);
+                __m256 cmp_cast = _mm256_castsi256_ps(cmp);           // concat msb of each 32b int
+                uint8_t shift = ((e + B < eEnd) ? 0 : ((e+B) - eEnd));
+        #ifdef AWU_MASKWIDTH_64
+                uint64_t mask_prep = static_cast<uint64_t>(_mm256_movemask_ps(cmp_cast));
+                mask |= static_cast<uint64_t>((mask_prep & static_cast<uint64_t>(0xffu >> shift)) << (f - e));
+        #else
+                uint32_t mask_prep = static_cast<uint32_t>(_mm256_movemask_ps(cmp_cast));
+                mask |= static_cast<uint32_t>((mask_prep & static_cast<uint32_t>(0xffu >> shift)) << (f - e));
+        #endif
+            }
+
+            if (f != std::min(e + B, eEnd)) {
+            #ifdef AWU_VEC_GATHER
+                // ========= Impl 1: staggered gather =============
+                __m256i fs = _mm256_set1_epi32(f*2);  // *(note), each element is 2*uint32_t
+                __m256i dcm_indices = _mm256_add_epi32(fs, dcm_offsets);
+
+                uint8_t shift = ((e + 8 < eEnd) ? 0 : ((e+8) - eEnd));
+                __m256i innermask = shiftToMask256(shift);  // uses the msb of each i32 element as maskbit
+
+                __m256i dcms = _mm256_mask_i32gather_epi32(_mm256_setzero_si256(), adjbase_avx, dcm_indices, innermask, 4);
+                __m256i nFScores = _mm256_add_epi32(fScores, dcms);
+                __m256i cmp1s = _mm256_cmpgt_epi32(targetDists, nFScores); // each arg: 1s if new < old, *compares signed ints
+                cmp1s = _mm256_and_si256(cmp1s, innermask); // only care about msb<i32>, set 0 if element is unused
+                
+                __m256i n_indices = _mm256_add_epi32(fs, n_offsets);
+                __m256i dsts = _mm256_mask_i32gather_epi32(_mm256_setzero_si256(), adjbase_avx, n_indices, cmp1s, 4);
+                __m256i twoxdsts = _mm256_add_epi32(dsts, dsts);
+                __m256i dstDatas = _mm256_mask_i32gather_epi32(_mm256_setzero_si256(), database_avx, twoxdsts, cmp1s, 4);
+                __m256i dstDists = _mm256_and_si256(dstDatas, FSCORE_VMASK);
+                __m256i cmp2s = _mm256_cmpgt_epi32(dstDists, nFScores); // *compares signed ints
+
+            #else
+                // ========== Impl 2: Packed load and Permute ========
+                __m256i adj_lo = _mm256_loadu_si256(adjbase_avxm);
+                __m256i adj_hi = _mm256_loadu_si256(adjbase_avxm + 1);
+                
+                __m256i perm_lo = _mm256_permutevar8x32_epi32(adj_lo, permute_mask);
+                __m256i perm_hi = _mm256_permutevar8x32_epi32(adj_hi, permute_mask);
+                
+                __m128i dcms_lo = _mm256_extracti128_si256(perm_lo, 1);
+                __m128i ns_hi = _mm256_extracti128_si256(perm_hi, 0);
+                __m256i dsts = _mm256_inserti128_si256(perm_lo, ns_hi, 1);      // Adj.n's
+                __m256i dcms = _mm256_inserti128_si256(perm_hi, dcms_lo, 0);    // Adj.d_cm's
+                
+                uint8_t shift = ((f + 8 < eEnd) ? 0 : ((f+8) - eEnd));
+                __m256i innermask = shiftToMask256(shift);  // uses the msb of each i32 element as maskbit
+                __m256i nFScores = _mm256_add_epi32(fScores, dcms);
+                __m256i cmp1s = _mm256_cmpgt_epi32(targetDists, nFScores); // each arg: 1s if new < old, *compares signed ints
+                cmp1s = _mm256_and_si256(cmp1s, innermask); // only care about msb<i32>, set 0 if element is unused
+
+                __m256i twoxdsts = _mm256_add_epi32(dsts, dsts);
+                __m256i dstDatas = _mm256_mask_i32gather_epi32(_mm256_setzero_si256(), database_avx, twoxdsts, cmp1s, 4);
+                __m256i dstDists = _mm256_and_si256(dstDatas, FSCORE_VMASK);
+                __m256i cmp2s = _mm256_cmpgt_epi32(dstDists, nFScores); // *compares signed ints
+            #endif // AWU_VEC_GATHER
+
+                __m256i cmp = _mm256_and_si256(cmp1s, cmp2s);
+                __m256 cmp_cast = _mm256_castsi256_ps(cmp);           // concat msb of each 32b int
+            #ifdef AWU_MASKWIDTH_64
+                uint64_t mask_prep = static_cast<uint64_t>(_mm256_movemask_ps(cmp_cast));
+                mask |= static_cast<uint64_t>((mask_prep & static_cast<uint64_t>(0xffu >> shift)) << (f - e));
+            #else
+                uint32_t mask_prep = static_cast<uint32_t>(_mm256_movemask_ps(cmp_cast));
+                mask |= static_cast<uint32_t>((mask_prep & static_cast<uint32_t>(0xffu >> shift)) << (f - e));
+            #endif
+            }
+
     #endif // vec scheme
             for (uint32_t i = countr_zero(mask);
                i < B;
@@ -751,6 +873,8 @@ int main(int argc, const char** argv) {
     std::cout << " FillVec";
 #   elif defined(AWU_VECSCHEME_MOSTOFVEC)
     std::cout << " MostOfVec";
+#   elif defined(AWU_VECSCHEME_MASKEDLAST)
+    std::cout << " MaskedLast";
 #   else
     std::cout << "\nError no vec scheme";
 #   endif
