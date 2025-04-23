@@ -43,24 +43,34 @@ constexpr static uint64_t FSCORE_MASK = 0x7fffffff; // exclude msb for vector si
 // #define AWU_MASK_VECTOR
 
 /*     Vectorization Scheme (no default) */
-// #define AWU_VECSCHEME_ALWAYS   // vecld: always use vector instructions to construct mask. Use inner mask to not-gather the excess vector elements
-// #define AWU_VECSCHEME_FILLVEC  // dynvec angus: vectorize only if (vertex.remaining_edges >= Bee), fill Bee-wide vector with Bee/(8) loops of vgather, else scalar
-// #define AWU_VECSCHEME_MOSTOFVEC   // dynvec mcj: Bee-bit-wide mask, vectorize (vertex.remaining_edges // (8) ) times, scalar (vertex.remaining_edges % (8) times)
+// #define AWU_VECSCHEME_MASKEDGATHER   // vecld: always use vector instructions to construct mask. Use inner mask to not-gather the excess vector elements
+// #define AWU_VECSCHEME_ROUNDDOWN   // dynvec mcj: Bee-bit-wide mask, vectorize (vertex.remaining_edges // (8) ) times, scalar (vertex.remaining_edges % (8) times)
 // #define AWU_VECSCHEME_MASKEDLAST   // Final: Vectorize if vector width can be filled, otherwise use masked gather
 
-/*     Mask Width (default 32) (does not affect AWU_VECSCHEME_ALWAYS) */
+/*     Mask Width (does not affect AWU_VECSCHEME_MASKEDGATHER) */
 // #define AWU_MASKWIDTH_64
+// #define AWU_MASKWIDTH_32
+// #define AWU_MASKWIDTH_16
+// #define AWU_MASKWIDTH_8
 
-/*     Gather vs packed load */
+/*     Gather vs packed load, no difference in performance
+         but as the code for Gather is easier to interpret,
+         it was used in all final evaluation and charts     */
 // #define AWU_VEC_GATHER
 
-#ifdef AWU_MASKWIDTH_64
+#if defined(AWU_VECSCHEME_MASKEDGATHER)
+constexpr uint32_t B = 8;   // 1 avx2 instructions long
+#elif defined(AWU_MASKWIDTH_64)
 constexpr uint32_t B = 64;   // 8 avx2 instructions long: avx2: 256b / uint32_t = (8)
 constexpr __uint128_t UINT128_MAX =__uint128_t(__int128_t(-1L));
-#elif defined(AWU_VECSCHEME_ALWAYS)
+#elif defined(AWU_MASKWIDTH_32)
+constexpr uint32_t B = 32;  // 4 avx2 instructions long
+#elif defined(AWU_MASKWIDTH_16)
+constexpr uint32_t B = 16;  // 2 avx2 instructions long
+#elif defined(AWU_MASKWIDTH_8)
 constexpr uint32_t B = 8;   // 1 avx2 instructions long
 #else
-constexpr uint32_t B = 32;   // 4 avx2 instructions long
+constexpr uint32_t B = 8;   // 1 avx2 instructions long
 #endif
 
 /* Functions */
@@ -235,7 +245,7 @@ void MQThreadTask(const Vertex* graph, MQ &wl, stat *stats,
         #endif
 
         for (uint32_t e = 0; e < eEnd; e += B) {
-    #ifdef AWU_VECSCHEME_ALWAYS // vec scheme
+    #ifdef AWU_VECSCHEME_MASKEDGATHER // vec scheme
         #ifdef AWU_VEC_GATHER
             // ========= Impl 1: staggered gather =============
             // <scalar ref> uint32_t adjNode_dcm = static_cast<uint32_t>(*(adjbase_avx + f*2 + 1));
@@ -306,83 +316,7 @@ void MQThreadTask(const Vertex* graph, MQ &wl, stat *stats,
             uint32_t mask_prep = static_cast<uint32_t>(_mm256_movemask_ps(cmp_cast));
             uint32_t mask = mask_prep & static_cast<uint32_t>(0xffu >> shift);
 
-    #elif defined(AWU_VECSCHEME_FILLVEC) // vec scheme
-        #ifdef AWU_MASKWIDTH_64
-            uint64_t mask = 0;
-        #else
-            uint32_t mask = 0;
-        #endif
-            if (e+B < eEnd) {
-                for (auto f = e; f < e+B; f += 8) {
-            #ifdef AWU_VEC_GATHER
-                    // <scalar ref> uint32_t adjNode_dcm = static_cast<uint32_t>(*(adjbase_avx + f*2 + 1));
-                    // <scalar ref> uint32_t nFScore = fScore + adjNode_dcm;
-                    // <scalar ref> bool cmp1 = targetDist > nFScore;
-                    __m256i fs = _mm256_set1_epi32(f*2);  // *(note), each element is 2*uint32_t
-                    __m256i dcm_indices = _mm256_add_epi32(fs, dcm_offsets);
-                    __m256i dcms = _mm256_mask_i32gather_epi32(_mm256_setzero_si256(), adjbase_avx, dcm_indices, _mm256_set1_epi64x(-1), 4);
-                    __m256i nFScores = _mm256_add_epi32(fScores, dcms);
-                    __m256i cmp1s = _mm256_cmpgt_epi32(targetDists, nFScores); // each arg: 1s if new < old, *compares signed ints
-
-                    // <scalar ref> uint32_t adjNode_n = static_cast<uint32_t>(*(adjbase_avx + f*2));
-                    // <scalar ref> uint32_t dst = adjNode_n;
-                    // <scalar ref> uint32_t dstData = static_cast<uint32_t>(*(database_avx + 2*dst));
-                    // <scalar ref> uint32_t dstDist = dstData & FSCORE_MASK;
-                    // <scalar ref> bool cmp2 = dstDist > nFScore;
-                    __m256i n_indices = _mm256_add_epi32(fs, n_offsets);
-                    __m256i dsts = _mm256_mask_i32gather_epi32(_mm256_setzero_si256(), adjbase_avx, n_indices, cmp1s, 4);
-                    __m256i twoxdsts = _mm256_add_epi32(dsts, dsts);
-                    __m256i dstDatas = _mm256_mask_i32gather_epi32(_mm256_setzero_si256(), database_avx, twoxdsts, cmp1s, 4);
-                    __m256i dstDists = _mm256_and_si256(dstDatas, FSCORE_VMASK);
-                    __m256i cmp2s = _mm256_cmpgt_epi32(dstDists, nFScores); // *compares signed ints
-
-            #else
-                    __m256i adj_lo = _mm256_loadu_si256(adjbase_avxm);
-                    __m256i adj_hi = _mm256_loadu_si256(adjbase_avxm + 1);
-
-                    __m256i perm_lo = _mm256_permutevar8x32_epi32(adj_lo, permute_mask);
-                    __m256i perm_hi = _mm256_permutevar8x32_epi32(adj_lo, permute_mask);
-                    
-                    __m128i dcms_lo = _mm256_extracti128_si256(perm_lo, 1);
-                    __m128i ns_hi = _mm256_extracti128_si256(perm_hi, 0);
-                    __m256i dsts = _mm256_inserti128_si256(perm_lo, ns_hi, 1);      // Adj.n's
-                    __m256i dcms = _mm256_inserti128_si256(perm_hi, dcms_lo, 0);    // Adj.d_cm's
-
-                    __m256i nFScores = _mm256_add_epi32(fScores, dcms);
-                    __m256i cmp1s = _mm256_cmpgt_epi32(targetDists, nFScores); // each arg: 1s if new < old, *compares signed ints
-
-                    __m256i twoxdsts = _mm256_add_epi32(dsts, dsts);
-                    __m256i dstDatas = _mm256_mask_i32gather_epi32(_mm256_setzero_si256(), database_avx, twoxdsts, cmp1s, 4);
-                    __m256i dstDists = _mm256_and_si256(dstDatas, FSCORE_VMASK);
-                    __m256i cmp2s = _mm256_cmpgt_epi32(dstDists, nFScores); // *compares signed ints
-
-            #endif
-                    __m256i cmp = _mm256_and_si256(cmp1s, cmp2s);
-                    __m256 cmp_cast = _mm256_castsi256_ps(cmp);           // concat msb of each 32b int
-                    uint8_t shift = ((e + B < eEnd) ? 0 : ((e+B) - eEnd));
-        #ifdef AWU_MASKWIDTH_64
-                    uint64_t mask_prep = static_cast<uint64_t>(_mm256_movemask_ps(cmp_cast));
-                    mask |= static_cast<uint64_t>((mask_prep & static_cast<uint64_t>(0xffu >> shift)) << (f - e));
-        #else
-                    uint32_t mask_prep = static_cast<uint32_t>(_mm256_movemask_ps(cmp_cast));
-                    mask |= static_cast<uint32_t>((mask_prep & static_cast<uint32_t>(0xffu >> shift)) << (f - e));
-        #endif
-                }
-            } else {
-                for (auto f = e; f != std::min(e + B, eEnd); f++) {
-                    const Adj & adjNode = *reinterpret_cast<const Adj*>(adjbase_scal + f);
-                    uint32_t nFScore = fScore + adjNode.d_cm;
-        #ifdef AWU_MASKWIDTH_64
-                    uint64_t cmp = static_cast<uint64_t>(targetDist > nFScore);
-                    mask |= static_cast<uint64_t>(cmp << (f - e));
-        #else
-                    uint32_t cmp = static_cast<uint32_t>(targetDist > nFScore);
-                    mask |= static_cast<uint32_t>(cmp << (f - e));
-        #endif
-                }
-            }
-
-    #elif defined(AWU_VECSCHEME_MOSTOFVEC) // vec scheme
+    #elif defined(AWU_VECSCHEME_ROUNDDOWN) // vec scheme
         #ifdef AWU_MASKWIDTH_64
             uint64_t mask = 0;
         #else
@@ -867,22 +801,28 @@ int main(int argc, const char** argv) {
     std::cout << " Scalar";
 #elif defined(AWU_MASK_VECTOR)
     std::cout << " Vector";
-#   ifdef AWU_VECSCHEME_ALWAYS
-    std::cout << " Always";
-#   elif defined(AWU_VECSCHEME_FILLVEC)
-    std::cout << " FillVec";
-#   elif defined(AWU_VECSCHEME_MOSTOFVEC)
-    std::cout << " MostOfVec";
+#   ifdef AWU_VECSCHEME_MASKEDGATHER
+    std::cout << " MaskedGather";
+#   elif defined(AWU_VECSCHEME_ROUNDDOWN)
+    std::cout << " RoundDown";
 #   elif defined(AWU_VECSCHEME_MASKEDLAST)
     std::cout << " MaskedLast";
 #   else
     std::cout << "\nError no vec scheme";
 #   endif
+
 #   ifdef AWU_MASKWIDTH_64
     std::cout << " MaskWidth-64b";
+#   elif defined(AWU_MASKWIDTH_32)
+    std::cout << " MaskWidth-32b";
+#   elif defined(AWU_MASKWIDTH_16)
+    std::cout << " MaskWidth-16b";
+#   elif defined(AWU_MASKWIDTH_8)
+    std::cout << " MaskWidth-8b";
 #   else
-    std::cout << " MaskWidth-Default32b";
+    std::cout << " MaskWidth-Default8b";
 #   endif
+
 #   ifdef AWU_VEC_GATHER
     std::cout << " Gather";
 #   else
